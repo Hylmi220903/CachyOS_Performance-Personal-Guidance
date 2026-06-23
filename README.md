@@ -1,6 +1,6 @@
 # Laporan Pengujian Performa & Responsivitas CachyOS
 
-Laporan ini mendokumentasikan hasil pengujian *stress-test* dan latensi sistem pada instalasi Linux-CachyOS. Pengujian ini bertujuan untuk memvalidasi apakah kombinasi parameter Kernel, *sysctl*, *scheduler* dinamis (scx_lavd), dan *patch* manajemen memori (lru_marie) mampu bersinergi untuk mempertahankan responsivitas sistem (mencegah *stuttering* atau *freeze*) di bawah tekanan komputasi, memori, dan I/O maksimal.
+Laporan ini mendokumentasikan hasil pengujian komprehensif atas *stress-test*, latensi sistem, serta reliabilitas jaringan pada instalasi Linux-CachyOS. Pengujian ini bertujuan untuk memvalidasi apakah kombinasi parameter Kernel, *sysctl*, *scheduler* dinamis (scx_lavd), *patch* manajemen memori (lru_marie), dan optimisasi *hardened networking stack* Bottleneck Bandwidth and Round-trip propagation time (BBR) mampu untuk mempertahankan tingkat responsivitas sistem tertinggi, baik di bawah tekanan komputasi, memori, I/O disk, maupun utilitas *bandwidth* jaringan secara maksimal dengan tetap mempertahankan efisiensi daya.
 
 ---
 
@@ -77,13 +77,20 @@ Dijalankan secara bersamaan:
 
 ---
 
-### Fase 3: Uji Throughput & Stabilitas Jaringan (TCP BBR)
+### Fase 3: Uji Throughput & Stabilitas Jaringan (BBR)
 **Metodologi:**
 Melakukan pengujian *real-world throughput* jarak jauh via protokol TCP tunggal ke server benua Eropa, dipadukan dengan pemantauan parameter *socket* aktif secara *real-time* menggunakan utilitas `ss`.
 
 **Hasil Observasi:**
 - **Sustained Throughput:** Kecepatan transfer TCP jarak jauh berlatensi tinggi sukses mencapai angka konstan **11.89 MB/s (~95 Mbps)** tanpa indikasi *throttling*.
-- **Window Scaling & BBR State:** Koneksi aktif diidentifikasi berjalan di atas algoritma kontrol `bbr`. Secara teknis, nilai *Send Window* (`snd_wnd`) dan *Receive Window* (`rcv_wnd`) berhasil terekspansi hingga di atas **1.1 MB** per koneksi dengan nilai *Round Trip Time* minimum (`minrtt`) yang tetap stabil di kisaran 30 ms.
+- **Window Scaling & BBR State:** Pemantauan soket membuktikan algoritma `bbr` mengambil alih *congestion control* secara absolut. Contoh *dump* metrik aktual saat koneksi mencapai beban puncak (*peak load*):
+  ```text
+  bbr:(bw:39497560bps,mrtt:30.193,pacing_gain:1.25,cwnd_gain:2) send 97322018bps ... rcv_ssthresh:209606 minrtt:30.171 ... snd_wnd:1140992 rcv_wnd:210944
+  ```
+  **Analisis Metrik:**
+  - **`bw:39497560bps`**: BBR mengukur estimasi *bandwidth* asli secara akurat hingga mendekati 40 Mbps pada *stream* tersebut, memungkinkannya mengabaikan *packet loss* biasa.
+  - **`snd_wnd:1140992` & `rcv_wnd:210944`**: Efek langsung dari konfigurasi `tcp_rmem` dan `tcp_wmem` raksasa (32 MB). Kernel mengizinkan *Send Window* merenggang lebar hingga melebihi **1.1 MB** per soket tanpa hambatan.
+  - **`minrtt:30.171`**: Meskipun batas *window* sedang terbuka penuh dan kecepatan dimaksimalkan, nilai *Round Trip Time* minimum tetap stabil di kisaran 30 ms tanpa menyebabkan efek *bufferbloat* (antrean panjang yang memicu *lag*).
 
 **Kesimpulan Fase 3:**
 Penerapan algoritma TCP BBR dan pelebaran batas *buffer* raksasa (`tcp_rmem` dan `tcp_wmem` pada skala 32 MB) berdampak krusial secara langsung. Kombinasi ini sukses mengatasi limitasi *Bandwidth-Delay Product* (BDP), mencegah laju data anjlok (*TCP stall*) akibat fluktuasi ping atau kehilangan paket minor (*packet drop*), dan mengoptimalkan transfer jaringan secara konsisten.
@@ -91,4 +98,4 @@ Penerapan algoritma TCP BBR dan pelebaran batas *buffer* raksasa (`tcp_rmem` dan
 ---
 
 ## 🏆 Konklusi Akhir
-Berdasarkan metrik pengujian di atas, instalasi **CachyOS** pada mesin AMD Ryzen 8845HS ini telah mencapai tingkat sinergi *Low-Latency* dan efisiensi yang nyaris sempurna. Modifikasi mendalam pada tingkatan Kernel, Cgroups, eBPF Scheduler, hingga parameter sistem jaringan (Networking/TCP) terbukti bukan sekadar konfigurasi kosmetik, melainkan dapat divalidasi dan diukur efektivitasnya secara nyata dalam mempertahankan keandalan operasional, baik di bawah tekanan memori, I/O disk, maupun utilisasi pita lebar maksimal.
+Berdasarkan metrik pengujian di atas, instalasi **CachyOS** pada AMD Ryzen 8845HS ini telah memastikan tingkat sinergi *Low-Latency* dan efisiensi yang nyaris sempurna. Modifikasi mendalam pada tingkat Kernel, Cgroups, eBPF Scheduler, hingga parameter sistem jaringan (Networking/TCP) terbukti bukan sekadar konfigurasi kosmetik, melainkan dapat divalidasi dan diukur efektivitasnya secara nyata dalam mempertahankan keandalan operasional, baik di bawah tekanan memori, I/O disk, maupun utilisasi pita lebar maksimal.
