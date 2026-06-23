@@ -1,0 +1,10 @@
+[Unit]
+Description=Re-apply ryzenadj profile every 30s (EC override safety net)
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

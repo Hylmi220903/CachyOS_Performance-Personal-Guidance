@@ -1,0 +1,11 @@
+[Unit]
+Description=Apply ryzenadj power profile (28W sustained, source-aware burst)
+After=multi-user.target
+ConditionPathExists=/usr/bin/ryzenadj
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ryzenadj-profile.sh
+
+[Install]
+WantedBy=multi-user.target

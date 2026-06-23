@@ -1,0 +1,1 @@
+GRUB_CMDLINE_LINUX_DEFAULT='nowatchdog nvme_load=YES plymouth.enable=0 disable_splash=1 zswap.enabled=0 loglevel=3 8250.nr_uarts=0 console=tty0 rcutree.enable_rcu_lazy=1 rcu_nocbs=all iommu=pt mitigations=off transparent_hugepage=madvise split_lock_detect=off cpuidle.governor=teo pcie_aspm=force threadirqs'
