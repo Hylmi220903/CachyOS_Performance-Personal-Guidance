@@ -1,4 +1,4 @@
-# 🚀 Laporan Pengujian Performa & Responsivitas CachyOS
+# Laporan Pengujian Performa & Responsivitas CachyOS
 
 Laporan ini mendokumentasikan hasil pengujian *stress-test* dan latensi sistem pada instalasi Linux-CachyOS. Pengujian ini bertujuan untuk memvalidasi apakah kombinasi parameter Kernel, *sysctl*, *scheduler* dinamis (scx_lavd), dan *patch* manajemen memori (lru_marie) mampu bersinergi untuk mempertahankan responsivitas sistem (mencegah *stuttering* atau *freeze*) di bawah tekanan komputasi, memori, dan I/O maksimal.
 
@@ -77,5 +77,18 @@ Dijalankan secara bersamaan:
 
 ---
 
+### Fase 3: Uji Throughput & Stabilitas Jaringan (TCP BBR)
+**Metodologi:**
+Melakukan pengujian *real-world throughput* jarak jauh via protokol TCP tunggal ke server benua Eropa, dipadukan dengan pemantauan parameter *socket* aktif secara *real-time* menggunakan utilitas `ss`.
+
+**Hasil Observasi:**
+- **Sustained Throughput:** Kecepatan transfer TCP jarak jauh berlatensi tinggi sukses mencapai angka konstan **11.89 MB/s (~95 Mbps)** tanpa indikasi *throttling*.
+- **Window Scaling & BBR State:** Koneksi aktif diidentifikasi berjalan di atas algoritma kontrol `bbr`. Secara teknis, nilai *Send Window* (`snd_wnd`) dan *Receive Window* (`rcv_wnd`) berhasil terekspansi hingga di atas **1.1 MB** per koneksi dengan nilai *Round Trip Time* minimum (`minrtt`) yang tetap stabil di kisaran 30 ms.
+
+**Kesimpulan Fase 3:**
+Penerapan algoritma TCP BBR dan pelebaran batas *buffer* raksasa (`tcp_rmem` dan `tcp_wmem` pada skala 32 MB) berdampak krusial secara langsung. Kombinasi ini sukses mengatasi limitasi *Bandwidth-Delay Product* (BDP), mencegah laju data anjlok (*TCP stall*) akibat fluktuasi ping atau kehilangan paket minor (*packet drop*), dan mengoptimalkan transfer jaringan secara konsisten.
+
+---
+
 ## 🏆 Konklusi Akhir
-Berdasarkan metrik pengujian di atas, instalasi **CachyOS** pada mesin AMD Ryzen 8845HS ini telah mencapai tingkat sinergi *Low-Latency* dan efisiensi memori yang nyaris sempurna. Modifikasi pada *layer* Kernel, Cgroups, eBPF Scheduler, dan *sysctl* terbukti bukan hanya "kosmetik", melainkan mampu diukur efektivitasnya secara nyata dalam mempertahankan pengalaman komputasi yang responsif di bawah tekanan komputasi terberat sekalipun.
+Berdasarkan metrik pengujian di atas, instalasi **CachyOS** pada mesin AMD Ryzen 8845HS ini telah mencapai tingkat sinergi *Low-Latency* dan efisiensi yang nyaris sempurna. Modifikasi mendalam pada tingkatan Kernel, Cgroups, eBPF Scheduler, hingga parameter sistem jaringan (Networking/TCP) terbukti bukan sekadar konfigurasi kosmetik, melainkan dapat divalidasi dan diukur efektivitasnya secara nyata dalam mempertahankan keandalan operasional, baik di bawah tekanan memori, I/O disk, maupun utilisasi pita lebar maksimal.
