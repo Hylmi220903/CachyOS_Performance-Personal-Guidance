@@ -38,6 +38,7 @@ Sistem dikonfigurasi secara spesifik untuk mengejar performa tingkat tinggi (Hig
   - Batas *buffer* `tcp_rmem` & `tcp_wmem` hingga 32MB.
 
 ### 3. Cgroups & Layanan Reclaim
+- **lru_marie**: Sebuah inovasi *kernel patch* untuk manajemen memori (khususnya *reclaim/swap*) yang dikembangkan oleh [firelzrd](https://github.com/firelzrd/lru_marie). *Patch* ini secara efisien mendeteksi dan mengevakuasi memori di bawah tekanan (*memory pressure*), menjadikannya sangat tangguh menghadapi risiko sistem *hang/OOM* saat digunakan bersama konfigurasi *swap/zRAM* pada Linux.
 - **Cgroups v2 (Unified)**: Aktif secara penuh.
 - **systemd-oomd**: `Disabled / Inactive`. Hal ini disengaja agar *userspace OOM killer* tidak mengganggu algoritma canggih dari *patch* `lru_marie` di level *kernel*.
 
