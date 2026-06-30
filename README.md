@@ -56,8 +56,8 @@ Pengujian dilakukan dalam kondisi sistem sedang aktif digunakan (skenario dunia 
 Membebani seluruh *thread* CPU hingga 100% menggunakan `stress-ng --matrix 0` selama 15 detik, sekaligus mengukur latensi interupsi sistem (*OS scheduling delay*) menggunakan `cyclictest` (interval 1ms).
 
 **Hasil Observasi:**
-- **Rata-rata Latensi (*Average*):** Sangat rendah, berkisar di angka **2.000 µs hingga 4.800 µs (2 - 4.8 ms)**.
-- **Latensi Maksimal (*Max Jitter*):** Mayoritas *thread* bertahan di bawah **20 ms**. Tercatat hanya satu lonjakan di *Thread* 10 (~231 ms) yang sangat wajar pada sistem non-RT di bawah beban matriks 100%.
+- **Rata-rata Latensi (*Average*):** Sangat rendah, berkisar di angka **1.941 µs hingga 4.800 µs (1.9 - 4.8 ms)**.
+- **Latensi Maksimal (*Max Jitter*):** Mayoritas *thread* konsisten bertahan di bawah **24 ms**. Tercatat lonjakan puncak pada kisaran **~126 ms** (meningkat dari baseline awal ~231 ms) yang sangat wajar pada sistem non-RT di bawah beban matriks 100%.
 - **Pengalaman Interaktif:** Pergerakan kursor tetikus (*mouse*) dan perpindahan *window* aplikasi tetap responsif, mulus, dan sama sekali tidak *freeze*.
 
 **Kesimpulan Fase 1:** Sinergi antara `scx_lavd` dan parameter `threadirqs` terbukti sangat efektif mencegah kelaparan CPU (*CPU starvation*) pada tugas-tugas interaktif UI/UX.
