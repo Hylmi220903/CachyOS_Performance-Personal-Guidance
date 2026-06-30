@@ -56,7 +56,7 @@ Pengujian dilakukan dalam kondisi sistem sedang aktif digunakan (skenario dunia 
 Membebani seluruh *thread* CPU hingga 100% menggunakan `stress-ng --matrix 0` selama 15 detik, sekaligus mengukur latensi interupsi sistem (*OS scheduling delay*) menggunakan `cyclictest` (interval 1ms).
 
 **Hasil Observasi:**
-- **Rata-rata Latensi (*Average*):** Sangat rendah, berkisar di angka **1.941 µs hingga 4.800 µs (1.9 - 4.8 ms)**.
+- **Rata-rata Latensi (*Average*):** Sangat rendah, berkisar di angka **1.941 µs hingga 4.221 µs (1.9 - 4.2 ms)**.
 - **Latensi Maksimal (*Max Jitter*):** Mayoritas *thread* konsisten bertahan di bawah **24 ms**. Tercatat lonjakan puncak pada kisaran **~126 ms** (meningkat dari baseline awal ~231 ms) yang sangat wajar pada sistem non-RT di bawah beban matriks 100%.
 - **Pengalaman Interaktif:** Pergerakan kursor tetikus (*mouse*) dan perpindahan *window* aplikasi tetap responsif, mulus, dan sama sekali tidak *freeze*.
 
