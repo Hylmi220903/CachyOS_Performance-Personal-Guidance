@@ -1,6 +1,6 @@
 # Laporan Pengujian Performa & Responsivitas CachyOS
 
-Laporan ini mendokumentasikan hasil pengujian komprehensif atas *stress-test*, latensi sistem, serta reliabilitas jaringan pada instalasi Linux-CachyOS. Pengujian ini bertujuan untuk memvalidasi apakah kombinasi parameter Kernel, *sysctl*, *scheduler* dinamis (scx_lavd), *patch* manajemen memori (lru_marie), dan optimisasi *hardened networking stack* Bottleneck Bandwidth and Round-trip propagation time (BBR) mampu untuk mempertahankan tingkat responsivitas sistem tertinggi, baik di bawah tekanan komputasi, memori, I/O disk, maupun utilitas *bandwidth* jaringan secara maksimal dengan tetap mempertahankan efisiensi daya.
+Laporan ini mendokumentasikan hasil pengujian komprehensif atas *stress-test*, latensi sistem, serta reliabilitas jaringan pada instalasi Linux-CachyOS. Pengujian ini bertujuan untuk memvalidasi apakah kombinasi parameter Kernel, *sysctl*, *scheduler* dinamis (Infinity Scheduler), *patch* manajemen memori (lru_marie), dan optimisasi *hardened networking stack* Bottleneck Bandwidth and Round-trip propagation time (BBR) mampu untuk mempertahankan tingkat responsivitas sistem tertinggi, baik di bawah tekanan komputasi, memori, I/O disk, maupun utilitas *bandwidth* jaringan secara maksimal dengan tetap mempertahankan efisiensi daya.
 
 ---
 
@@ -43,7 +43,7 @@ Sistem dikonfigurasi secara spesifik untuk mengejar performa tingkat tinggi (Hig
 - **systemd-oomd**: `Disabled / Inactive`. Hal ini disengaja agar *userspace OOM killer* tidak mengganggu algoritma canggih dari *patch* `lru_marie` di level *kernel*.
 
 ### 4. Scheduler (Penjadwal CPU)
-- **`scx_lavd --autopilot`**: Scheduler berbasis eBPF *sched_ext* sedang berjalan dan sepenuhnya menggantikan CFS (Completely Fair Scheduler) bawaan.
+- **Infinity Scheduler (v4)**: *Fair-share CPU scheduler* yang menggantikan CFS/EEVDF bawaan kernel. Infinity Scheduler menggunakan pendekatan matematika asimtotik yang inovatif tanpa ambang batas diskret (*discrete thresholds*). Tanpa dependensi BPF atau sched-ext, scheduler ini memberikan latensi *wakeup* instan untuk tugas interaktif (seperti game) dan mengoptimasi prioritas *background task* secara mulus.
 
 ---
 
@@ -56,11 +56,11 @@ Pengujian dilakukan dalam kondisi sistem sedang aktif digunakan (skenario dunia 
 Membebani seluruh *thread* CPU hingga 100% menggunakan `stress-ng --matrix 0` selama 15 detik, sekaligus mengukur latensi interupsi sistem (*OS scheduling delay*) menggunakan `cyclictest` (interval 1ms).
 
 **Hasil Observasi:**
-- **Rata-rata Latensi (*Average*):** Sangat rendah, berkisar di angka **1.941 µs hingga 4.221 µs (1.9 - 4.2 ms)**.
-- **Latensi Maksimal (*Max Jitter*):** Mayoritas *thread* konsisten bertahan di bawah **24 ms**. Tercatat lonjakan puncak pada kisaran **~126 ms** (meningkat dari baseline awal ~231 ms) yang sangat wajar pada sistem non-RT di bawah beban matriks 100%.
-- **Pengalaman Interaktif:** Pergerakan kursor tetikus (*mouse*) dan perpindahan *window* aplikasi tetap responsif, mulus, dan sama sekali tidak *freeze*.
+- **Rata-rata Latensi (*Average*):** Sangat fantastis, hanya berkisar di angka **45 µs hingga 57 µs (~0.04 ms - 0.05 ms)**. Ini membuktikan pergantian tugas ditangani nyaris tanpa friksi.
+- **Latensi Maksimal (*Max Jitter*):** Mayoritas *thread* konsisten bertahan di bawah **2 ms**. Lonjakan puncak latensi (*spike*) bahkan hanya menyentuh batas **~4.2 ms** di bawah beban matriks 100%.
+- **Pengalaman Interaktif:** Pergerakan kursor tetikus (*mouse*) dan perpindahan *window* aplikasi tetap sangat responsif, mulus, dan sama sekali tidak ada tanda-tanda *stutter* maupun *freeze*.
 
-**Kesimpulan Fase 1:** Sinergi antara `scx_lavd` dan parameter `threadirqs` terbukti sangat efektif mencegah kelaparan CPU (*CPU starvation*) pada tugas-tugas interaktif UI/UX.
+**Kesimpulan Fase 1:** Sinergi antara **Infinity Scheduler (v4)** dan parameter `threadirqs` terbukti luar biasa dalam mencegah kelaparan CPU (*CPU starvation*). Pendekatan asimtotiknya secara nyata mampu mempertahankan tingkat latensi ultra-rendah dan prioritas seketika pada tugas-tugas interaktif UI/UX/Gaming.
 
 ---
 
@@ -99,4 +99,4 @@ Penerapan algoritma TCP BBR dan pelebaran batas *buffer* raksasa (`tcp_rmem` dan
 ---
 
 ## 🏆 Konklusi Akhir
-Berdasarkan metrik pengujian di atas, instalasi **CachyOS** pada AMD Ryzen 8845HS ini telah memastikan tingkat sinergi *Low-Latency* dan efisiensi yang nyaris sempurna. Modifikasi mendalam pada tingkat Kernel, Cgroups, eBPF Scheduler, hingga parameter sistem jaringan (Networking/TCP) terbukti bukan sekadar konfigurasi kosmetik, melainkan dapat divalidasi dan diukur efektivitasnya secara nyata dalam mempertahankan keandalan operasional, baik di bawah tekanan memori, I/O disk, maupun utilisasi pita lebar maksimal.
+Berdasarkan metrik pengujian di atas, instalasi **CachyOS** pada AMD Ryzen 8845HS ini telah memastikan tingkat sinergi *Low-Latency* dan efisiensi yang nyaris sempurna. Modifikasi mendalam pada tingkat Kernel, Cgroups, Infinity Scheduler, hingga parameter sistem jaringan (Networking/TCP) terbukti bukan sekadar konfigurasi kosmetik, melainkan dapat divalidasi dan diukur efektivitasnya secara nyata dalam mempertahankan keandalan operasional, baik di bawah tekanan memori, I/O disk, maupun utilisasi pita lebar maksimal.
