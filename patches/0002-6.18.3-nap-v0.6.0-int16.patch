@@ -38,7 +38,7 @@ diff -urN a/drivers/cpuidle/governors/nap/Makefile b/drivers/cpuidle/governors/n
 +CFLAGS_nap_nn_avx2.o   += $(CC_FLAGS_FPU) -mavx -mavx2 -mfma
 diff -urN a/drivers/cpuidle/governors/nap/nap.c b/drivers/cpuidle/governors/nap/nap.c
 --- a/drivers/cpuidle/governors/nap/nap.c	1970-01-01 08:00:00.000000000 +0800
-+++ b/drivers/cpuidle/governors/nap/nap.c	2026-07-10 23:49:24.446786014 +0800
++++ b/drivers/cpuidle/governors/nap/nap.c	2026-07-11 00:19:02.492481300 +0800
 @@ -0,0 +1,175 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
@@ -71,7 +71,7 @@ diff -urN a/drivers/cpuidle/governors/nap/nap.c b/drivers/cpuidle/governors/nap/
 +}
 +
 +DEFINE_PER_CPU(struct nap_cpu_data, nap_data);
-+static struct cpuidle_driver *nap_cached_drv;
++struct cpuidle_driver *nap_cached_drv;
 +
 +static void nap_history_update(struct nap_cpu_data *d, u64 measured_ns)
 +{
@@ -217,8 +217,8 @@ diff -urN a/drivers/cpuidle/governors/nap/nap.c b/drivers/cpuidle/governors/nap/
 +postcore_initcall(nap_init);
 diff -urN a/drivers/cpuidle/governors/nap/nap.h b/drivers/cpuidle/governors/nap/nap.h
 --- a/drivers/cpuidle/governors/nap/nap.h	1970-01-01 08:00:00.000000000 +0800
-+++ b/drivers/cpuidle/governors/nap/nap.h	2026-07-10 23:49:24.446798197 +0800
-@@ -0,0 +1,301 @@
++++ b/drivers/cpuidle/governors/nap/nap.h	2026-07-11 00:19:14.039836488 +0800
+@@ -0,0 +1,302 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef NAP_H
 +#define NAP_H
@@ -441,6 +441,7 @@ diff -urN a/drivers/cpuidle/governors/nap/nap.h b/drivers/cpuidle/governors/nap/
 +
 +/* ISA dispatch static key (defined in nap.c) */
 +DECLARE_STATIC_KEY_FALSE(nap_use_avx2);
++extern struct cpuidle_driver *nap_cached_drv;
 +
 +/* ================================================================
 + * Function declarations
