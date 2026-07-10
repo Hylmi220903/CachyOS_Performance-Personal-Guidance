@@ -217,7 +217,7 @@ diff -urN a/drivers/cpuidle/governors/nap/nap.c b/drivers/cpuidle/governors/nap/
 +postcore_initcall(nap_init);
 diff -urN a/drivers/cpuidle/governors/nap/nap.h b/drivers/cpuidle/governors/nap/nap.h
 --- a/drivers/cpuidle/governors/nap/nap.h	1970-01-01 08:00:00.000000000 +0800
-+++ b/drivers/cpuidle/governors/nap/nap.h	2026-07-11 00:19:14.039836488 +0800
++++ b/drivers/cpuidle/governors/nap/nap.h	2026-07-11 00:30:27.224439074 +0800
 @@ -0,0 +1,302 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef NAP_H
@@ -412,7 +412,7 @@ diff -urN a/drivers/cpuidle/governors/nap/nap.h b/drivers/cpuidle/governors/nap/
 +	float  learn_d_out;
 +	float  learn_lr;
 +	float  learn_d_hid[NAP_HIDDEN_SIZE] __aligned(32);
-+	float  hidden_out_f[NAP_HIDDEN_SIZE] __aligned(32);
++	float  hidden_out[NAP_HIDDEN_SIZE] __aligned(32);
 +	float  features_f32[NAP_INPUT_SIZE] __aligned(32);
 +	struct nap_weights *active_w;
 +
@@ -996,7 +996,7 @@ diff -urN a/drivers/cpuidle/governors/nap/nap_nn_sse2.c b/drivers/cpuidle/govern
 +}
 diff -urN a/drivers/cpuidle/governors/nap/nap_train.c b/drivers/cpuidle/governors/nap/nap_train.c
 --- a/drivers/cpuidle/governors/nap/nap_train.c	1970-01-01 08:00:00.000000000 +0800
-+++ b/drivers/cpuidle/governors/nap/nap_train.c	2026-07-10 23:49:24.446841987 +0800
++++ b/drivers/cpuidle/governors/nap/nap_train.c	2026-07-11 00:30:16.661947398 +0800
 @@ -0,0 +1,186 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
@@ -1158,7 +1158,7 @@ diff -urN a/drivers/cpuidle/governors/nap/nap_train.c b/drivers/cpuidle/governor
 +		}
 +
 +		d->active_w = &d->weights_float;
-+		nap_nn_forward(d->features_f32, &s, d->hidden_out_f, d->active_w);
++		nap_nn_forward(d->features_f32, &s, d->hidden_out, d->active_w);
 +
 +		/* Ordinal head gradient */
 +		float lr = (float)d->learning_rate_millths / 1000.0f;
