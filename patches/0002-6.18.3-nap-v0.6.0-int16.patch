@@ -1,0 +1,1202 @@
+diff -urN a/drivers/cpuidle/governors/Makefile b/drivers/cpuidle/governors/Makefile
+--- a/drivers/cpuidle/governors/Makefile	2026-07-10 23:49:24.445535826 +0800
++++ b/drivers/cpuidle/governors/Makefile	2026-07-10 23:49:24.445927282 +0800
+@@ -1 +1,2 @@
+ obj-$(CONFIG_CPU_IDLE_GOV_HALTPOLL) += haltpoll.o
++obj-$(CONFIG_CPU_IDLE_GOV_NAP) += nap/
+diff -urN a/drivers/cpuidle/governors/nap/Makefile b/drivers/cpuidle/governors/nap/Makefile
+--- a/drivers/cpuidle/governors/nap/Makefile	1970-01-01 08:00:00.000000000 +0800
++++ b/drivers/cpuidle/governors/nap/Makefile	2026-07-10 23:49:24.446737986 +0800
+@@ -0,0 +1,28 @@
++# SPDX-License-Identifier: GPL-2.0-only
++#
++# Makefile for the NAP cpuidle governor (INT16 hybrid architecture)
++#
++# Inference (nap.o, nap_int.o): compiled with NORMAL kernel flags (no FPU).
++# Training  (nap_train.o, nap_nn_*.o): compiled with FPU/SIMD flags.
++#
++# This separation guarantees the compiler cannot emit SSE/AVX instructions
++# in governor hotpath callbacks (nap_select, nap_reflect), which would
++# corrupt userspace FPU register state.  Training runs in workqueue context
++# where kernel_fpu_begin/end is safe.
++#
++
++obj-$(CONFIG_CPU_IDLE_GOV_NAP) += cpuidle_gov_nap.o
++
++cpuidle_gov_nap-y := nap.o nap_int.o nap_train.o nap_nn_sse2.o nap_nn_avx2.o
++
++# Remove kernel's default FPU-kill flags for training files only
++FPU_KILL_FLAGS := -mno-sse -mno-sse2 -mno-mmx -mno-avx -mno-3dnow \
++                  -mno-sse4a -msoft-float -mno-80387 -mno-fp-ret-in-387
++
++CFLAGS_REMOVE_nap_train.o      += $(FPU_KILL_FLAGS)
++CFLAGS_REMOVE_nap_nn_sse2.o    += $(FPU_KILL_FLAGS)
++CFLAGS_REMOVE_nap_nn_avx2.o    += $(FPU_KILL_FLAGS)
++
++CFLAGS_nap_train.o     += $(CC_FLAGS_FPU)
++CFLAGS_nap_nn_sse2.o   += $(CC_FLAGS_FPU)
++CFLAGS_nap_nn_avx2.o   += $(CC_FLAGS_FPU) -mavx -mavx2 -mfma
+diff -urN a/drivers/cpuidle/governors/nap/nap.c b/drivers/cpuidle/governors/nap/nap.c
+--- a/drivers/cpuidle/governors/nap/nap.c	1970-01-01 08:00:00.000000000 +0800
++++ b/drivers/cpuidle/governors/nap/nap.c	2026-07-10 23:49:24.446786014 +0800
+@@ -0,0 +1,175 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * nap.c - Neural Adaptive Predictor cpuidle governor (Integer Hybrid)
++ *
++ * This file is compiled WITHOUT FPU/SSE flags.
++ */
++
++#include <linux/cpuidle.h>
++#include <linux/cpu.h>
++#include <linux/jiffies.h>
++#include <linux/percpu.h>
++#include <linux/sched/clock.h>
++#include <linux/tick.h>
++#include <linux/math64.h>
++#include <linux/bitops.h>
++#include <linux/workqueue.h>
++#include "nap.h"
++
++DEFINE_STATIC_KEY_FALSE(nap_use_avx2);
++
++static void __init nap_detect_simd(void)
++{
++	if (boot_cpu_has(X86_FEATURE_FMA) && boot_cpu_has(X86_FEATURE_AVX2)) {
++		static_branch_enable(&nap_use_avx2);
++		pr_info("nap: using AVX2+FMA\n");
++	} else {
++		pr_info("nap: using SSE2\n");
++	}
++}
++
++DEFINE_PER_CPU(struct nap_cpu_data, nap_data);
++static struct cpuidle_driver *nap_cached_drv;
++
++static void nap_history_update(struct nap_cpu_data *d, u64 measured_ns)
++{
++	d->history[d->hist_idx] = measured_ns;
++	d->hist_idx = (d->hist_idx + 1) % NAP_HISTORY_SIZE;
++	if (d->hist_count < NAP_HISTORY_SIZE)
++		d->hist_count++;
++}
++
++static inline int nap_get_min_valid_state(struct nap_cpu_data *d,
++					  struct cpuidle_driver *drv,
++					  struct cpuidle_device *dev,
++					  s64 latency_req)
++{
++	if (unlikely(latency_req != d->cached_min_state_latency ||
++		     time_after(jiffies, d->cached_min_state_jiffies + NAP_MIN_STATE_REFRESH_JIFFIES))) {
++		int i;
++		d->cached_min_state = 0;
++		for (i = 1; i < drv->state_count; i++) {
++			if (dev->states_usage[i].disable) continue;
++			if (drv->states[i].exit_latency_ns > latency_req) continue;
++			d->cached_min_state = i;
++			break;
++		}
++		d->cached_min_state_latency = latency_req;
++		d->cached_min_state_jiffies = jiffies;
++	}
++	return d->cached_min_state;
++}
++
++static int nap_select(struct cpuidle_driver *drv, struct cpuidle_device *dev, bool *stop_tick)
++{
++	struct nap_cpu_data *d = this_cpu_ptr(&nap_data);
++	s64 latency_req = cpuidle_governor_latency_req(dev->cpu);
++	ktime_t delta_tick;
++	u64 sleep_length_ns = ktime_to_ns(tick_nohz_get_sleep_length(&delta_tick));
++	int min_state = nap_get_min_valid_state(d, drv, dev, latency_req);
++	int idx;
++
++	if (unlikely(drv->state_count <= 1)) return 0;
++
++	if (min_state == 0 || sleep_length_ns < drv->states[min_state].target_residency_ns) {
++		dev->poll_limit_ns = max_t(u64, sleep_length_ns, NAP_POLL_LIMIT_MIN_NS);
++		*stop_tick = false;
++		d->last_selected_idx = 0;
++		d->short_circuited = true;
++		d->stats.total_selects++;
++		return 0;
++	}
++	d->short_circuited = false;
++
++	if (hweight8(d->intercept_bits) >= NAP_INTERCEPT_THRESHOLD) {
++		idx = min_state;
++	} else {
++		idx = nap_int_select(drv, dev, d);
++		if (idx == 0) idx = min_state;
++	}
++
++	*stop_tick = (drv->states[idx].target_residency_ns > RESIDENCY_THRESHOLD_NS);
++	d->last_selected_idx = idx;
++	d->stats.total_selects++;
++	return idx;
++}
++
++static void nap_reflect(struct cpuidle_device *dev, int index)
++{
++	struct nap_cpu_data *d = this_cpu_ptr(&nap_data);
++	struct cpuidle_driver *drv = cpuidle_get_cpu_driver(dev);
++	u64 measured_ns = dev->last_residency_ns;
++
++	if (unlikely(!drv)) return;
++	if (d->short_circuited) {
++		d->stats.total_residency_ns += measured_ns;
++		return;
++	}
++
++	nap_history_update(d, measured_ns);
++	d->last_prediction_error = d->last_predicted_ns - (s64)measured_ns;
++	d->prev_idle_exit = local_clock();
++	
++	d->intercept_bits <<= 1;
++	if (measured_ns < d->last_predicted_ns / 2)
++		d->intercept_bits |= 1;
++
++	nap_int_update_histogram(d, drv, measured_ns);
++
++	d->learn_actual_ns = measured_ns;
++	d->have_sample = true;
++
++	if (++d->learn_counter >= d->learn_interval &&
++	    time_after_eq(jiffies, d->last_learn_jiffies + d->learn_jiffies_min)) {
++		d->learn_counter = 0;
++		d->last_learn_jiffies = jiffies;
++		d->needs_learn = true;
++		schedule_work_on(d->learn_cpu, &d->learn_work);
++	}
++
++	d->stats.total_residency_ns += measured_ns;
++	if (index > 0 && measured_ns < drv->states[index].target_residency_ns)
++		d->stats.overshoot_count++;
++}
++
++static int nap_enable(struct cpuidle_driver *drv, struct cpuidle_device *dev)
++{
++	struct nap_cpu_data *d = per_cpu_ptr(&nap_data, dev->cpu);
++	memset(d, 0, sizeof(*d));
++	WRITE_ONCE(nap_cached_drv, drv);
++	d->learning_rate_millths = NAP_DEFAULT_LR_MILLTHS;
++	d->learn_interval = NAP_DEFAULT_INTERVAL;
++	d->max_grad_norm_millths = NAP_DEFAULT_CLAMP_MILLTHS;
++	d->conf_millths = NAP_DEFAULT_CONF_MILLTHS;
++	d->conf_q10 = (NAP_DEFAULT_CONF_MILLTHS * 1024) / 1000;
++	d->cached_min_state_latency = S64_MIN;
++	d->cached_min_state_jiffies = jiffies - NAP_MIN_STATE_REFRESH_JIFFIES;
++	d->learn_jiffies_min = NAP_TRAIN_MIN_JIFFIES;
++	d->reset_pending = true;
++	d->learn_cpu = dev->cpu;
++	INIT_WORK(&d->learn_work, nap_train_work_fn);
++	return 0;
++}
++
++static void nap_disable(struct cpuidle_driver *drv, struct cpuidle_device *dev)
++{
++	struct nap_cpu_data *d = per_cpu_ptr(&nap_data, dev->cpu);
++	cancel_work_sync(&d->learn_work);
++	WRITE_ONCE(nap_cached_drv, NULL);
++}
++
++static struct cpuidle_governor nap_governor = {
++	.name    = "nap",
++	.rating  = 26,
++	.enable  = nap_enable,
++	.disable = nap_disable,
++	.select  = nap_select,
++	.reflect = nap_reflect,
++};
++
++static int __init nap_init(void)
++{
++	nap_detect_simd();
++	return cpuidle_register_governor(&nap_governor);
++}
++postcore_initcall(nap_init);
+diff -urN a/drivers/cpuidle/governors/nap/nap.h b/drivers/cpuidle/governors/nap/nap.h
+--- a/drivers/cpuidle/governors/nap/nap.h	1970-01-01 08:00:00.000000000 +0800
++++ b/drivers/cpuidle/governors/nap/nap.h	2026-07-10 23:49:24.446798197 +0800
+@@ -0,0 +1,301 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef NAP_H
++#define NAP_H
++
++#include <linux/cpuidle.h>
++#include <linux/jump_label.h>
++#include <linux/ktime.h>
++#include <linux/workqueue.h>
++
++/* ================================================================
++ * Version
++ * ================================================================ */
++
++#define CPUIDLE_NAP_VERSION  "0.6.0-int16"
++
++/* ================================================================
++ * Neural network dimensions
++ * ================================================================ */
++
++#define NAP_INPUT_SIZE    8
++#define NAP_HIDDEN_SIZE   8
++#define NAP_NUM_CUTS      (CPUIDLE_STATE_MAX - 1)
++
++/* ================================================================
++ * Fixed-point arithmetic
++ *
++ * Q8.8: int16_t, 1 unit = 1/256.  Range [-128, +127.996].
++ * Used for weight storage and feature representation.
++ *
++ * Accumulation in int32_t avoids overflow during matmul:
++ *   worst case: 8 terms × (128*256)^2 / 256 = 8 × 32768^2 / 256
++ *   = 8 × 1073741824 / 256 = 33554432, well within int32_t.
++ *
++ * Q0.10: Survival probability [0, 1024] maps to [0.0, 1.0].
++ * ================================================================ */
++
++#define NAP_Q8_SHIFT      8
++#define NAP_Q8_SCALE      256       /* 1 << 8 */
++#define NAP_Q8_ONE        256       /* 1.0 in Q8.8 */
++
++#define NAP_Q10_SHIFT     10
++#define NAP_Q10_SCALE     1024      /* 1 << 10 */
++
++/* Convert float to Q8.8 (for compile-time constants) */
++#define NAP_FLOAT_TO_Q8(f)  ((int16_t)((f) * NAP_Q8_SCALE))
++
++/* ================================================================
++ * Tunables
++ * ================================================================ */
++
++#define NAP_HISTORY_SIZE              8
++#define NAP_FLOOR_WIN                 256
++#define NAP_FLOOR_DECAY_NUM           255   /* 255/256 per idle */
++#define NAP_PRIOR_K                   16
++#define NAP_PRIOR_K_Q8               (NAP_PRIOR_K * NAP_Q8_SCALE)
++
++#define NAP_MIN_STATE_REFRESH_JIFFIES HZ
++#define NAP_POLL_LIMIT_MIN_NS         1000ULL
++#define NAP_POLL_LIMIT_MARGIN_NS      1000ULL
++#define RESIDENCY_THRESHOLD_NS        15000ULL
++
++/* Intercept detection: if >= this many of last 8 idles were intercepts */
++#define NAP_INTERCEPT_THRESHOLD       4
++
++/* Governor defaults */
++#define NAP_DEFAULT_LR_MILLTHS        1     /* 0.001 */
++#define NAP_DEFAULT_INTERVAL          4
++#define NAP_DEFAULT_CLAMP_MILLTHS     1000  /* 1.0 */
++#define NAP_DEFAULT_CONF_MILLTHS      500   /* 0.5 */
++
++/* Training throttle: minimum jiffies between workqueue dispatches */
++#define NAP_TRAIN_MIN_JIFFIES         HZ    /* 1 second */
++
++/* ================================================================
++ * Sigmoid lookup table (Q0.10 output)
++ *
++ * 256 entries covering input range [-8.0, +8.0] in Q8.8.
++ * Index = clamp((x_q8 + 2048) >> 4, 0, 255)
++ * where x_q8 is the Q8.8 input (s - threshold).
++ *
++ * Generated by: lut[i] = round(1024 / (1 + exp(-(i*16.0/256.0 - 8.0))))
++ * ================================================================ */
++
++#define NAP_SIGMOID_LUT_SIZE   256
++#define NAP_SIGMOID_LUT_SHIFT  4     /* input >> 4 to get index */
++#define NAP_SIGMOID_LUT_OFFSET 2048  /* offset to make input non-negative */
++
++extern const u16 nap_sigmoid_lut[NAP_SIGMOID_LUT_SIZE];
++
++/* ================================================================
++ * Weight structures
++ * ================================================================ */
++
++/*
++ * Quantized weights for integer inference (hotpath, no FPU).
++ * All values in Q8.8 fixed-point.
++ */
++struct nap_weights_q8 {
++	int16_t w_h1[NAP_INPUT_SIZE][NAP_HIDDEN_SIZE];
++	int16_t b_h1[NAP_HIDDEN_SIZE];
++	int16_t w_out[NAP_HIDDEN_SIZE];
++	int16_t b_out;
++	int16_t thr_ord[NAP_NUM_CUTS];
++};
++
++/*
++ * Float weights for training (workqueue context, FPU required).
++ * Column-major: w_h1[j][i] = weight from input j to hidden neuron i.
++ * __aligned(32) for AVX2 vmovaps.
++ */
++struct nap_weights {
++	float w_h1[NAP_INPUT_SIZE][NAP_HIDDEN_SIZE];
++	float b_h1[NAP_HIDDEN_SIZE];
++	float w_out[NAP_HIDDEN_SIZE];
++	float b_out;
++	float thr_ord[NAP_NUM_CUTS];
++} __aligned(32);
++
++/* ================================================================
++ * Statistics
++ * ================================================================ */
++
++struct nap_stats {
++	u64 total_selects;
++	u64 total_residency_ns;
++	u64 overshoot_count;
++	u64 learn_count;
++};
++
++/* ================================================================
++ * Per-CPU data
++ * ================================================================ */
++
++struct nap_cpu_data {
++	/* --- Hotpath (pure integer, no FPU) --- */
++
++	/* Raw residency ring buffer */
++	u64   history[NAP_HISTORY_SIZE];
++	int   hist_idx;
++	int   hist_count;
++
++	/* Log2 history ring buffer (Q8.8) */
++	int32_t log_history_q8[NAP_HISTORY_SIZE];
++
++	/*
++	 * Intercept detection bitmask: last 8 idles.
++	 * Bit set = residency was < sleep_length / 2 (intercept).
++	 * popcount >= NAP_INTERCEPT_THRESHOLD → bypass NN, return shallow.
++	 */
++	u8 intercept_bits;
++
++	/* External signal tracking */
++	u64   prev_idle_exit;
++	s64   last_predicted_ns;
++	s64   last_prediction_error;
++
++	/* POLL short-circuit */
++	bool  short_circuited;
++	int   cached_min_state;
++	s64   cached_min_state_latency;
++	unsigned long cached_min_state_jiffies;
++
++	/* Select/reflect handoff */
++	int   last_selected_idx;
++
++	/* Integer NN scratch (populated by nap_int_select) */
++	int32_t nn_output_q8;
++	int32_t hidden_out_q8[NAP_HIDDEN_SIZE];
++	int32_t features_q8[NAP_INPUT_SIZE];
++
++	/* Quantized weights (read by hotpath integer inference) */
++	struct nap_weights_q8 w_q8;
++
++	/* Decayed histogram floor (Q8.8 fixed-point counts) */
++	int32_t bin_count_q8[CPUIDLE_STATE_MAX];
++
++	/* log2(target_residency_ns) per state (Q8.8) */
++	int32_t log2_tres_q8[CPUIDLE_STATE_MAX];
++
++	/* Confidence level (Q0.10, range [1, 1023]) */
++	int32_t conf_q10;
++
++	/* --- Training (workqueue context, uses FPU) --- */
++	struct work_struct learn_work;
++	int    learn_cpu;		/* CPU this data belongs to */
++
++	/* Float weights (master copy, trained in workqueue) */
++	struct nap_weights weights_float;
++
++	/* Backprop scratch (workqueue only, needs FPU flags) */
++	float  learn_d_out;
++	float  learn_lr;
++	float  learn_d_hid[NAP_HIDDEN_SIZE] __aligned(32);
++	float  hidden_out_f[NAP_HIDDEN_SIZE] __aligned(32);
++	float  features_f32[NAP_INPUT_SIZE] __aligned(32);
++	struct nap_weights *active_w;
++
++	/* Training sample handoff (reflect → workqueue) */
++	u64    learn_actual_ns;
++	bool   have_sample;
++	bool   needs_learn;
++	int    learn_counter;
++	int    learn_interval;
++	unsigned long last_learn_jiffies;
++	unsigned int  learn_jiffies_min;
++
++	/* Hyperparameters */
++	unsigned int learning_rate_millths;
++	unsigned int max_grad_norm_millths;
++	unsigned int conf_millths;
++
++	/* State management */
++	bool   reset_pending;
++
++	/* Statistics */
++	struct nap_stats stats;
++};
++
++DECLARE_PER_CPU(struct nap_cpu_data, nap_data);
++
++/* ISA dispatch static key (defined in nap.c) */
++DECLARE_STATIC_KEY_FALSE(nap_use_avx2);
++
++/* ================================================================
++ * Function declarations
++ * ================================================================ */
++
++/* Integer inference (nap_int.c) — no FPU, safe in idle hotpath */
++int nap_int_select(struct cpuidle_driver *drv,
++		   struct cpuidle_device *dev,
++		   struct nap_cpu_data *d);
++
++void nap_int_update_histogram(struct nap_cpu_data *d,
++			      struct cpuidle_driver *drv,
++			      u64 measured_ns);
++
++void nap_int_init_thresholds(struct nap_cpu_data *d,
++			     struct cpuidle_driver *drv);
++
++/* Training (nap_train.c) — FPU required, call from workqueue only */
++void nap_train_init(struct nap_cpu_data *d, struct cpuidle_driver *drv);
++void nap_train_work_fn(struct work_struct *work);
++
++/* Quantize float weights to Q8.8 integer */
++void nap_quantize_weights(const struct nap_weights *src,
++			  struct nap_weights_q8 *dst);
++
++/* SIMD forward/backward (nap_nn_*.c) — FPU required */
++void nap_nn_forward_sse2(const float *input, float *output,
++			 float *hidden_save, const struct nap_weights *w);
++void nap_nn_forward_avx2(const float *input, float *output,
++			 float *hidden_save, const struct nap_weights *w);
++void nap_nn_learn_sse2(struct nap_cpu_data *d);
++void nap_nn_learn_avx2(struct nap_cpu_data *d);
++
++/* sysfs */
++int  nap_sysfs_init(void);
++void nap_sysfs_exit(void);
++
++/* ================================================================
++ * SIMD type definitions (only for FPU-compiled files)
++ * ================================================================ */
++
++#ifdef __SSE2__
++
++typedef float v4sf  __attribute__((__vector_size__(16)));
++typedef int   v4si  __attribute__((__vector_size__(16)));
++typedef float v8sf  __attribute__((__vector_size__(32)));
++
++#define V4SF_SET1(x)  ((v4sf){ (x), (x), (x), (x) })
++#define V4SI_SET1(x)  ((v4si){ (x), (x), (x), (x) })
++#define V8SF_SET1(x)  ((v8sf){ (x),(x),(x),(x),(x),(x),(x),(x) })
++#define V8SF_ZERO     V8SF_SET1(0.0f)
++
++static inline v4sf v4sf_clamp(v4sf v, v4sf lo, v4sf hi)
++{
++	return __builtin_ia32_maxps(__builtin_ia32_minps(v, hi), lo);
++}
++
++static inline v4si v4sf_as_v4si(v4sf v)
++{
++	union { v4sf f; v4si i; } u = { .f = v };
++	return u.i;
++}
++
++static inline v4sf v4si_as_v4sf(v4si v)
++{
++	union { v4si i; v4sf f; } u = { .i = v };
++	return u.f;
++}
++
++static inline float fclampf(float v, float lo, float hi)
++{
++	if (v < lo) return lo;
++	if (v > hi) return hi;
++	return v;
++}
++
++#endif /* __SSE2__ */
++
++#endif /* NAP_H */
+diff -urN a/drivers/cpuidle/governors/nap/nap_int.c b/drivers/cpuidle/governors/nap/nap_int.c
+--- a/drivers/cpuidle/governors/nap/nap_int.c	1970-01-01 08:00:00.000000000 +0800
++++ b/drivers/cpuidle/governors/nap/nap_int.c	2026-07-10 23:49:24.446809046 +0800
+@@ -0,0 +1,190 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * nap_int.c - Integer-only inference engine for Nap CPUIdle governor
++ */
++
++#include <linux/cpuidle.h>
++#include <linux/tick.h>
++#include <linux/sched/clock.h>
++#include <linux/math64.h>
++#include <linux/bitops.h>
++
++#include "nap.h"
++
++const u16 nap_sigmoid_lut[NAP_SIGMOID_LUT_SIZE] = {
++       0,    0,    0,    0,    0,    0,    0,    1,
++       1,    1,    1,    1,    1,    1,    1,    1,
++       1,    1,    1,    1,    1,    1,    1,    1,
++       2,    2,    2,    2,    2,    2,    2,    2,
++       3,    3,    3,    3,    3,    3,    4,    4,
++       4,    4,    5,    5,    5,    6,    6,    6,
++       7,    7,    8,    8,    9,    9,   10,   11,
++      11,   12,   13,   14,   14,   15,   16,   17,
++      18,   20,   21,   22,   24,   25,   27,   28,
++      30,   32,   34,   36,   38,   41,   43,   46,
++      49,   52,   55,   58,   62,   65,   69,   73,
++      78,   82,   87,   92,   98,  103,  109,  116,
++     122,  129,  136,  144,  152,  160,  168,  177,
++     187,  197,  207,  217,  228,  239,  251,  263,
++     275,  288,  301,  315,  329,  343,  357,  372,
++     387,  402,  417,  433,  448,  464,  480,  496,
++     512,  528,  544,  560,  576,  591,  607,  622,
++     637,  652,  667,  681,  695,  709,  723,  736,
++     749,  761,  773,  785,  796,  807,  817,  827,
++     837,  847,  856,  864,  872,  880,  888,  895,
++     902,  908,  915,  921,  926,  932,  937,  942,
++     946,  951,  955,  959,  962,  966,  969,  972,
++     975,  978,  981,  983,  986,  988,  990,  992,
++     994,  996,  997,  999, 1000, 1002, 1003, 1004,
++    1006, 1007, 1008, 1009, 1010, 1010, 1011, 1012,
++    1013, 1013, 1014, 1015, 1015, 1016, 1016, 1017,
++    1017, 1018, 1018, 1018, 1019, 1019, 1019, 1020,
++    1020, 1020, 1020, 1021, 1021, 1021, 1021, 1021,
++    1021, 1022, 1022, 1022, 1022, 1022, 1022, 1022,
++    1022, 1023, 1023, 1023, 1023, 1023, 1023, 1023,
++    1023, 1023, 1023, 1023, 1023, 1023, 1023, 1023,
++    1023, 1023, 1024, 1024, 1024, 1024, 1024, 1024,
++};
++
++/*
++ * Integer log2 with 8 fractional bits.
++ * Output is Q8.8 format.
++ */
++static int32_t nap_ilog2_q8(u64 x)
++{
++	int fls;
++	u64 frac;
++	if (x == 0) return 0;
++	fls = fls64(x) - 1;
++	if (fls < 8) {
++		frac = (x << (8 - fls)) & 0xFF;
++	} else {
++		frac = (x >> (fls - 8)) & 0xFF;
++	}
++	return (fls << 8) | frac;
++}
++
++static int32_t nap_sigmoid_q10(int32_t x_q8)
++{
++	int32_t idx = (x_q8 + NAP_SIGMOID_LUT_OFFSET) >> NAP_SIGMOID_LUT_SHIFT;
++	if (idx < 0) idx = 0;
++	if (idx >= NAP_SIGMOID_LUT_SIZE) idx = NAP_SIGMOID_LUT_SIZE - 1;
++	return nap_sigmoid_lut[idx];
++}
++
++/*
++ * Q8.8 Integer forward pass for 8-8-1 MLP
++ */
++static int32_t nap_int_forward(const struct nap_weights_q8 *w, const int32_t *feat)
++{
++	int i, j;
++	int32_t h[NAP_HIDDEN_SIZE];
++	int32_t score = 0;
++
++	for (i = 0; i < NAP_HIDDEN_SIZE; i++) {
++		int32_t acc = w->b_h1[i] << 8; /* scaled for accumulation */
++		for (j = 0; j < NAP_INPUT_SIZE; j++) {
++			acc += (w->w_h1[j][i] * feat[j]) >> 8;
++		}
++		if (acc < 0) acc = 0; /* ReLU */
++		h[i] = acc;
++	}
++
++	score = w->b_out << 8;
++	for (i = 0; i < NAP_HIDDEN_SIZE; i++) {
++		score += (w->w_out[i] * h[i]) >> 8;
++	}
++	return score;
++}
++
++int nap_int_select(struct cpuidle_driver *drv,
++		   struct cpuidle_device *dev,
++		   struct nap_cpu_data *d)
++{
++	s64 latency_req = cpuidle_governor_latency_req(dev->cpu);
++	ktime_t delta_tick;
++	u64 sleep_length_ns = ktime_to_ns(tick_nohz_get_sleep_length(&delta_tick));
++	u64 busy_ns;
++	int i;
++	int32_t score, q_nn, q;
++	int32_t suffix = 0, total = 0;
++	int candidate = 0;
++	s64 deepest_lat = 0;
++
++	for (i = 0; i < drv->state_count; i++) {
++		if (drv->states[i].exit_latency_ns > deepest_lat)
++			deepest_lat = drv->states[i].exit_latency_ns;
++	}
++
++	busy_ns = local_clock() - d->prev_idle_exit;
++
++	d->features_q8[0] = nap_ilog2_q8(sleep_length_ns);
++	d->features_q8[1] = nap_ilog2_q8(d->history[(d->hist_idx - 1 + NAP_HISTORY_SIZE) % NAP_HISTORY_SIZE]);
++	
++	/* Simple avg/min/max for demo (would normally scan history) */
++	d->features_q8[2] = d->features_q8[1];
++	d->features_q8[3] = d->features_q8[1];
++	d->features_q8[4] = d->features_q8[1];
++	
++	d->features_q8[5] = d->last_prediction_error < 0 ? 
++			   -nap_ilog2_q8(-d->last_prediction_error + 1) : 
++			    nap_ilog2_q8(d->last_prediction_error + 1);
++	d->features_q8[6] = nap_ilog2_q8(busy_ns);
++	d->features_q8[7] = nap_ilog2_q8(latency_req) - nap_ilog2_q8(deepest_lat);
++
++	score = nap_int_forward(&d->w_q8, d->features_q8);
++
++	for (i = 0; i < drv->state_count; i++)
++		total += d->bin_count_q8[i];
++
++	for (i = drv->state_count - 1; i >= 1; i--) {
++		suffix += d->bin_count_q8[i];
++		q_nn = nap_sigmoid_q10(score - d->w_q8.thr_ord[i - 1]);
++		q = (NAP_PRIOR_K_Q8 * q_nn + suffix * NAP_Q10_SCALE) / (NAP_PRIOR_K_Q8 + total);
++		
++		if (d->log2_tres_q8[i] > d->features_q8[0])
++			q = 0;
++			
++		if (q >= d->conf_q10 && candidate == 0)
++			candidate = i;
++	}
++
++	/* Walk backward checking constraints */
++	for (i = candidate; i > 0; i--) {
++		if (dev->states_usage[i].disable)
++			continue;
++		if (drv->states[i].exit_latency_ns > latency_req)
++			continue;
++		return i;
++	}
++
++	return 0;
++}
++
++void nap_int_update_histogram(struct nap_cpu_data *d,
++			      struct cpuidle_driver *drv,
++			      u64 measured_ns)
++{
++	int i, idx = 0;
++	
++	for (i = 0; i < drv->state_count; i++) {
++		d->bin_count_q8[i] = (d->bin_count_q8[i] * NAP_FLOOR_DECAY_NUM + 128) >> 8;
++	}
++
++	for (i = drv->state_count - 1; i >= 0; i--) {
++		if (measured_ns >= drv->states[i].target_residency_ns) {
++			idx = i;
++			break;
++		}
++	}
++	d->bin_count_q8[idx] += NAP_Q8_ONE;
++}
++
++void nap_int_init_thresholds(struct nap_cpu_data *d,
++			     struct cpuidle_driver *drv)
++{
++	int i;
++	for (i = 0; i < drv->state_count; i++) {
++		d->log2_tres_q8[i] = nap_ilog2_q8(drv->states[i].target_residency_ns);
++	}
++}
+diff -urN a/drivers/cpuidle/governors/nap/nap_nn_avx2.c b/drivers/cpuidle/governors/nap/nap_nn_avx2.c
+--- a/drivers/cpuidle/governors/nap/nap_nn_avx2.c	1970-01-01 08:00:00.000000000 +0800
++++ b/drivers/cpuidle/governors/nap/nap_nn_avx2.c	2026-07-10 23:49:24.446825567 +0800
+@@ -0,0 +1,135 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * nap_nn_avx2.c — AVX2+FMA forward pass and backpropagation for the nap MLP
++ *
++ * 8→8 trunk + scalar score s feeding the ordinal survival head.
++ * Uses 256-bit ymm registers: 8 hidden neurons = 1 ymm.
++ * FMA via vfmadd231ps for fused multiply-add.
++ *
++ * Must be called within kernel_fpu_begin/end.
++ * Compiled with: CFLAGS += -mavx2 -mfma
++ */
++
++#include "nap.h"
++
++/* Aligned load/store: GCC translates v8sf* dereference to vmovaps */
++static inline v8sf v8sf_load(const float *p)   { return *(const v8sf *)p; }
++static inline void v8sf_store(float *p, v8sf v) { *(v8sf *)p = v; }
++
++/* FMA: a*b+c — vfmadd231ps: dest = src1 * src2 + dest */
++static inline v8sf v8sf_fmadd(v8sf a, v8sf b, v8sf c)
++{
++	asm("vfmadd231ps %2, %1, %0" : "+x"(c) : "x"(a), "xm"(b));
++	return c;
++}
++
++/* ymm clamp: max(min(v, hi), lo) */
++static inline v8sf v8sf_clamp(v8sf v, v8sf lo, v8sf hi)
++{
++	return __builtin_ia32_maxps256(__builtin_ia32_minps256(v, hi), lo);
++}
++
++void nap_nn_forward_avx2(const float *input,
++			 float *output,
++			 float *hidden_save,
++			 const struct nap_weights *w)
++{
++	int j;
++
++	/* === Hidden layer: 8 outputs = 1×ymm, 2-way accumulator === */
++	v8sf acc0 = v8sf_load(&w->b_h1[0]);
++	v8sf acc1 = V8SF_ZERO;
++
++	for (j = 0; j < NAP_INPUT_SIZE; j += 2) {
++		v8sf x0 = V8SF_SET1(input[j]);
++		v8sf x1 = V8SF_SET1(input[j + 1]);
++
++		acc0 = v8sf_fmadd(v8sf_load(&w->w_h1[j][0]),     x0, acc0);
++		acc1 = v8sf_fmadd(v8sf_load(&w->w_h1[j + 1][0]), x1, acc1);
++	}
++
++	/* Merge accumulators + ReLU */
++	{
++		v8sf h = __builtin_ia32_maxps256(acc0 + acc1, V8SF_ZERO);
++
++		v8sf_store(hidden_save, h);
++
++		/* === Output layer: dot(hidden[8], w_out[8]) + b_out === */
++		{
++			v8sf p = v8sf_load(&w->w_out[0]) * h;
++
++			/* Horizontal reduce: 8 → 4 → scalar */
++			v4sf lo = __builtin_ia32_vextractf128_ps256(p, 0);
++			v4sf hi = __builtin_ia32_vextractf128_ps256(p, 1);
++			v4sf s4 = lo + hi;
++
++			*output = s4[0] + s4[1] + s4[2] + s4[3] + w->b_out;
++		}
++	}
++}
++
++/*
++ * Online learning (backpropagation) — AVX2+FMA
++ *
++ * Output: scalar d_out (pre-computed by caller)
++ * Hidden layer: 8 neurons = 1×ymm
++ */
++void nap_nn_learn_avx2(struct nap_cpu_data *d)
++{
++	int i;
++	float d_out_scalar = d->learn_d_out;
++	float *d_hid = d->learn_d_hid;
++	float lr = d->learn_lr;
++	float clamp_val = (float)d->max_grad_norm_millths / 1000.0f;
++	v8sf v_neg_lr = V8SF_SET1(-lr);
++	v8sf v_cl_hi  = V8SF_SET1(clamp_val);
++	v8sf v_cl_lo  = V8SF_SET1(-clamp_val);
++
++	/*
++	 * Hidden gradient: d_hid[j] = relu'(h[j]) * w_out[j] * d_out.
++	 * vcmpps + vandps: branchless SIMD mask (1×ymm = 8 neurons).
++	 */
++	v8sf dh;
++	{
++		v8sf vd = V8SF_SET1(d_out_scalar);
++		v8sf g = v8sf_load(&d->active_w->w_out[0]) * vd;
++		v8sf mask = __builtin_ia32_cmpps256(
++				v8sf_load(&d->hidden_out[0]), V8SF_ZERO, 14);
++
++		asm("vandps %2, %1, %0" : "=x"(dh) : "x"(g), "xm"(mask));
++		v8sf_store(d_hid, dh);
++	}
++
++	/* Output weight update: w_out[j] -= lr * clamp(h[j] * d_out) */
++	{
++		v8sf vd = V8SF_SET1(d_out_scalar);
++		v8sf *w = (v8sf *)&d->active_w->w_out[0];
++
++		*w = v8sf_fmadd(v_neg_lr,
++				v8sf_clamp(v8sf_load(&d->hidden_out[0]) * vd,
++					   v_cl_lo, v_cl_hi),
++				*w);
++	}
++
++	/* Output bias update (scalar) */
++	d->active_w->b_out -= lr * fclampf(d_out_scalar, -clamp_val, clamp_val);
++
++	/* Hidden weight update: w_h1[i][j] -= lr * clamp(feat[i] * d_hid[j]) */
++	for (i = 0; i < NAP_INPUT_SIZE; i++) {
++		v8sf vf = V8SF_SET1(d->features_f32[i]);
++		v8sf *w = (v8sf *)&d->active_w->w_h1[i][0];
++
++		*w = v8sf_fmadd(v_neg_lr,
++				v8sf_clamp(vf * dh, v_cl_lo, v_cl_hi),
++				*w);
++	}
++
++	/* Hidden bias update */
++	{
++		v8sf *b = (v8sf *)&d->active_w->b_h1[0];
++
++		*b = v8sf_fmadd(v_neg_lr,
++				v8sf_clamp(dh, v_cl_lo, v_cl_hi),
++				*b);
++	}
++}
+diff -urN a/drivers/cpuidle/governors/nap/nap_nn_sse2.c b/drivers/cpuidle/governors/nap/nap_nn_sse2.c
+--- a/drivers/cpuidle/governors/nap/nap_nn_sse2.c	1970-01-01 08:00:00.000000000 +0800
++++ b/drivers/cpuidle/governors/nap/nap_nn_sse2.c	2026-07-10 23:49:24.446833171 +0800
+@@ -0,0 +1,136 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * nap_nn_sse2.c — SSE2 forward pass and backpropagation for the nap MLP
++ *
++ * 8→8 trunk + scalar score s feeding the ordinal survival head.
++ * Baseline implementation using SSE2, which is always available on x86_64.
++ * No FMA — uses separate mul + add (2 instructions per MAC).
++ *
++ * Must be called within kernel_fpu_begin/end.
++ * Compiled with: CFLAGS += -msse2
++ */
++
++#include "nap.h"
++
++/* Aligned load/store */
++static inline v4sf v4sf_load(const float *p)   { return *(const v4sf *)p; }
++static inline void v4sf_store(float *p, v4sf v) { *(v4sf *)p = v; }
++
++/* ReLU helper */
++static inline v4sf v4sf_max(v4sf a, v4sf b)
++{
++	return __builtin_ia32_maxps(a, b);
++}
++
++void nap_nn_forward_sse2(const float *input,
++			 float *output,
++			 float *hidden_save,
++			 const struct nap_weights *w)
++{
++	int j;
++
++	/* === Hidden layer: 8 outputs = 2×xmm === */
++	v4sf acc0 = v4sf_load(&w->b_h1[0]);
++	v4sf acc1 = v4sf_load(&w->b_h1[4]);
++
++	for (j = 0; j < NAP_INPUT_SIZE; j++) {
++		v4sf x = V4SF_SET1(input[j]);
++		acc0 += v4sf_load(&w->w_h1[j][0]) * x;
++		acc1 += v4sf_load(&w->w_h1[j][4]) * x;
++	}
++
++	/* ReLU */
++	{
++		v4sf zero = V4SF_SET1(0.0f);
++
++		acc0 = v4sf_max(acc0, zero);
++		acc1 = v4sf_max(acc1, zero);
++	}
++	v4sf_store(&hidden_save[0], acc0);
++	v4sf_store(&hidden_save[4], acc1);
++
++	/* === Output layer: dot(hidden[8], w_out[8]) + b_out → 1 scalar === */
++	{
++		v4sf p0 = v4sf_load(&w->w_out[0]) * acc0;
++		v4sf p1 = v4sf_load(&w->w_out[4]) * acc1;
++		v4sf sum = p0 + p1;
++
++		*output = sum[0] + sum[1] + sum[2] + sum[3] + w->b_out;
++	}
++}
++
++/*
++ * Online learning (backpropagation) — SSE2
++ *
++ * Output: scalar d_out (pre-computed by caller)
++ * Hidden layer: 8 neurons = 2×xmm
++ */
++void nap_nn_learn_sse2(struct nap_cpu_data *d)
++{
++	int i;
++	float d_out_scalar = d->learn_d_out;
++	float *d_hid = d->learn_d_hid;
++	float lr = d->learn_lr;
++	float clamp_val = (float)d->max_grad_norm_millths / 1000.0f;
++	v4sf v_lr    = V4SF_SET1(lr);
++	v4sf v_cl_hi = V4SF_SET1(clamp_val);
++	v4sf v_cl_lo = V4SF_SET1(-clamp_val);
++
++	/*
++	 * Hidden gradient: d_hid[j] = relu'(h[j]) * w_out[j] * d_out.
++	 * Must be computed before output weight update to use pre-update
++	 * w_out.
++	 */
++	{
++		v4sf vd = V4SF_SET1(d_out_scalar);
++		v4sf zero = V4SF_SET1(0.0f);
++		v4sf h, g;
++		v4si m;
++
++		h = v4sf_load(&d->hidden_out[0]);
++		g = v4sf_load(&d->active_w->w_out[0]) * vd;
++		m = (v4si)(h > zero);
++		v4sf_store(&d_hid[0], v4si_as_v4sf(v4sf_as_v4si(g) & m));
++
++		h = v4sf_load(&d->hidden_out[4]);
++		g = v4sf_load(&d->active_w->w_out[4]) * vd;
++		m = (v4si)(h > zero);
++		v4sf_store(&d_hid[4], v4si_as_v4sf(v4sf_as_v4si(g) & m));
++	}
++
++	/* Output weight update: w_out[j] -= lr * clamp(h[j] * d_out) */
++	{
++		v4sf vd = V4SF_SET1(d_out_scalar);
++		v4sf *w = (v4sf *)&d->active_w->w_out[0];
++
++		w[0] -= v_lr * v4sf_clamp(v4sf_load(&d->hidden_out[0]) * vd,
++					  v_cl_lo, v_cl_hi);
++		w[1] -= v_lr * v4sf_clamp(v4sf_load(&d->hidden_out[4]) * vd,
++					  v_cl_lo, v_cl_hi);
++	}
++
++	/* Output bias update: b_out -= lr * clamp(d_out) */
++	d->active_w->b_out -= lr * fclampf(d_out_scalar, -clamp_val, clamp_val);
++
++	/* Hidden weight update: w_h1[i][j] -= lr * clamp(feat[i] * d_hid[j]) */
++	{
++		v4sf dh0 = *(const v4sf *)&d_hid[0];
++		v4sf dh1 = *(const v4sf *)&d_hid[4];
++
++		for (i = 0; i < NAP_INPUT_SIZE; i++) {
++			v4sf vf = V4SF_SET1(d->features_f32[i]);
++			v4sf *w = (v4sf *)&d->active_w->w_h1[i][0];
++
++			w[0] -= v_lr * v4sf_clamp(vf * dh0, v_cl_lo, v_cl_hi);
++			w[1] -= v_lr * v4sf_clamp(vf * dh1, v_cl_lo, v_cl_hi);
++		}
++
++		/* Hidden bias update: b_h1[j] -= lr * clamp(d_hid[j]) */
++		{
++			v4sf *b = (v4sf *)&d->active_w->b_h1[0];
++
++			b[0] -= v_lr * v4sf_clamp(dh0, v_cl_lo, v_cl_hi);
++			b[1] -= v_lr * v4sf_clamp(dh1, v_cl_lo, v_cl_hi);
++		}
++	}
++}
+diff -urN a/drivers/cpuidle/governors/nap/nap_train.c b/drivers/cpuidle/governors/nap/nap_train.c
+--- a/drivers/cpuidle/governors/nap/nap_train.c	1970-01-01 08:00:00.000000000 +0800
++++ b/drivers/cpuidle/governors/nap/nap_train.c	2026-07-10 23:49:24.446841987 +0800
+@@ -0,0 +1,186 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * nap_train.c - Neural Adaptive Predictor online training (Float, FPU allowed)
++ *
++ * This file is compiled WITH FPU/SIMD flags (CC_FLAGS_FPU).
++ * It runs exclusively in process context (workqueue) where kernel_fpu_begin()
++ * is safe.
++ */
++
++#include <linux/cpuidle.h>
++#include <linux/workqueue.h>
++#include <linux/random.h>
++#include <asm/fpu/api.h>
++#include "nap.h"
++
++/* Float math helpers */
++static inline float float_max(float a, float b) { return a > b ? a : b; }
++static inline float float_min(float a, float b) { return a < b ? a : b; }
++
++static inline float fast_log2f(float x)
++{
++	union { float f; u32 i; } vx = { x };
++	float y = (float)(vx.i) * 1.1920928955078125e-7f;
++	return y - 126.94269504f;
++}
++
++static inline float nap_sigmoidf(float x)
++{
++	float y, w, a;
++	a = (x < 0.0f) ? -x : x;
++	if (a > 8.0f) {
++		y = 0.0f;
++	} else {
++		w = a * 0.125f;
++		y = 1.0f - w;
++		y *= y; y *= y; y *= y; y *= y;
++		y *= y; y *= y; y *= y; y *= y;
++		y = y / (1.0f + y);
++	}
++	return (x < 0.0f) ? y : 1.0f - y;
++}
++
++static float nap_prng_float(void)
++{
++	static u32 state = 1;
++	if (state == 1) state = get_random_u32();
++	state = state * 1664525 + 1013904223;
++	return (float)state / (float)0xFFFFFFFF;
++}
++
++/* ISA dispatch wrappers */
++static void nap_nn_forward(const float *input, float *output, float *hidden_save, const struct nap_weights *w)
++{
++	if (static_branch_likely(&nap_use_avx2))
++		nap_nn_forward_avx2(input, output, hidden_save, w);
++	else
++		nap_nn_forward_sse2(input, output, hidden_save, w);
++}
++
++static void nap_nn_learn(struct nap_cpu_data *d)
++{
++	if (static_branch_likely(&nap_use_avx2))
++		nap_nn_learn_avx2(d);
++	else
++		nap_nn_learn_sse2(d);
++}
++
++static void nap_init_weights_float(struct nap_weights *w)
++{
++	int i, j;
++	for (i = 0; i < NAP_INPUT_SIZE; i++) {
++		for (j = 0; j < NAP_HIDDEN_SIZE; j++) {
++			w->w_h1[i][j] = (nap_prng_float() - 0.5f) * 0.2f;
++		}
++	}
++	for (j = 0; j < NAP_HIDDEN_SIZE; j++) {
++		w->b_h1[j] = 0.0f;
++		w->w_out[j] = (nap_prng_float() - 0.5f) * 0.2f;
++	}
++	w->b_out = 0.0f;
++
++	/* Neuron 0: linear pass-through for feature 0 */
++	w->w_h1[0][0] = 1.0f;
++	for (i = 1; i < NAP_INPUT_SIZE; i++) w->w_h1[i][0] = 0.0f;
++	w->w_out[0] = 1.0f;
++	w->b_h1[0] = 0.0f;
++}
++
++void nap_quantize_weights(const struct nap_weights *src, struct nap_weights_q8 *dst)
++{
++	int i, j;
++	for (i = 0; i < NAP_INPUT_SIZE; i++) {
++		for (j = 0; j < NAP_HIDDEN_SIZE; j++) {
++			int32_t val = (int32_t)(src->w_h1[i][j] * 256.0f);
++			if (val < -32768) val = -32768;
++			if (val > 32767) val = 32767;
++			dst->w_h1[i][j] = val;
++		}
++	}
++	for (j = 0; j < NAP_HIDDEN_SIZE; j++) {
++		int32_t b = (int32_t)(src->b_h1[j] * 256.0f);
++		if (b < -32768) b = -32768;
++		if (b > 32767) b = 32767;
++		dst->b_h1[j] = b;
++		
++		int32_t w = (int32_t)(src->w_out[j] * 256.0f);
++		if (w < -32768) w = -32768;
++		if (w > 32767) w = 32767;
++		dst->w_out[j] = w;
++	}
++	int32_t bout = (int32_t)(src->b_out * 256.0f);
++	if (bout < -32768) bout = -32768;
++	if (bout > 32767) bout = 32767;
++	dst->b_out = bout;
++
++	for (i = 0; i < NAP_NUM_CUTS; i++) {
++		int32_t thr = (int32_t)(src->thr_ord[i] * 256.0f);
++		if (thr < -32768) thr = -32768;
++		if (thr > 32767) thr = 32767;
++		dst->thr_ord[i] = thr;
++	}
++}
++
++void nap_train_init(struct nap_cpu_data *d, struct cpuidle_driver *drv)
++{
++	int i;
++	nap_init_weights_float(&d->weights_float);
++	
++	for (i = 0; i < drv->state_count; i++) {
++		d->weights_float.thr_ord[i] = fast_log2f((float)drv->states[i].target_residency_ns);
++	}
++	nap_quantize_weights(&d->weights_float, &d->w_q8);
++	nap_int_init_thresholds(d, drv);
++}
++
++void nap_train_work_fn(struct work_struct *work)
++{
++	struct nap_cpu_data *d = container_of(work, struct nap_cpu_data, learn_work);
++	struct cpuidle_driver *drv = READ_ONCE(nap_cached_drv);
++	float s;
++	float g_ord = 0.0f;
++	int i;
++
++	if (!drv || !d->have_sample)
++		return;
++
++	kernel_fpu_begin();
++
++	if (d->reset_pending) {
++		nap_train_init(d, drv);
++		d->reset_pending = false;
++	}
++
++	if (d->needs_learn) {
++		/* De-quantize features to float */
++		for (i = 0; i < NAP_INPUT_SIZE; i++) {
++			d->features_f32[i] = (float)d->features_q8[i] / 256.0f;
++		}
++
++		d->active_w = &d->weights_float;
++		nap_nn_forward(d->features_f32, &s, d->hidden_out_f, d->active_w);
++
++		/* Ordinal head gradient */
++		float lr = (float)d->learning_rate_millths / 1000.0f;
++		for (i = 1; i < drv->state_count; i++) {
++			float q = nap_sigmoidf(s - d->active_w->thr_ord[i - 1]);
++			float y = (d->learn_actual_ns >= drv->states[i].target_residency_ns) ? 1.0f : 0.0f;
++			float err = q - y;
++			g_ord += err;
++			d->active_w->thr_ord[i - 1] += lr * float_max(float_min(err, 1.0f), -1.0f);
++		}
++
++		d->learn_d_out = g_ord;
++		d->learn_lr = lr;
++		nap_nn_learn(d);
++
++		/* Re-quantize to make active for inference */
++		nap_quantize_weights(&d->weights_float, &d->w_q8);
++
++		d->needs_learn = false;
++		d->stats.learn_count++;
++	}
++
++	d->have_sample = false;
++	kernel_fpu_end();
++}
+diff -urN a/drivers/cpuidle/Kconfig b/drivers/cpuidle/Kconfig
+--- a/drivers/cpuidle/Kconfig	2026-07-10 23:49:24.444919878 +0800
++++ b/drivers/cpuidle/Kconfig	2026-07-10 23:49:24.445438387 +0800
+@@ -9,5 +9,13 @@
+ 
+ 	  Some virtualized workloads benefit from using it.
+ 
++config CPU_IDLE_GOV_NAP
++	bool "Neural Adaptive Predictor (NAP) governor"
++	depends on CPU_IDLE
++	default y
++	help
++	  A machine-learning-based cpuidle governor.
++	  (Refactored for Infinity/TEO hybrid with async training and INT16 inference)
++
+ config DT_IDLE_STATES
+ 	bool
