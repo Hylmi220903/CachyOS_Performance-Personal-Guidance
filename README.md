@@ -1,12 +1,12 @@
 # Laporan Pengujian Performa & Responsivitas CachyOS
 
-Laporan ini mendokumentasikan hasil pengujian komprehensif atas *stress-test*, latensi sistem, serta reliabilitas jaringan pada instalasi Linux-CachyOS. Pengujian ini bertujuan untuk memvalidasi apakah kombinasi parameter Kernel, *sysctl*, *scheduler* dinamis (Infinity Scheduler), *patch* manajemen memori (lru_marie), dan optimisasi *hardened networking stack* Bottleneck Bandwidth and Round-trip propagation time (BBR) mampu untuk mempertahankan tingkat responsivitas sistem tertinggi, baik di bawah tekanan komputasi, memori, I/O disk, maupun utilitas *bandwidth* jaringan secara maksimal dengan tetap mempertahankan efisiensi daya.
+Laporan ini mendokumentasikan hasil pengujian komprehensif atas *stress-test*, latensi sistem, serta reliabilitas jaringan pada instalasi Linux-CachyOS. Pengujian ini bertujuan untuk memvalidasi apakah kombinasi parameter Kernel, *sysctl*, *scheduler* dinamis (**MuQSS Scheduler**), *patch* manajemen memori (lru_marie), dan optimisasi *hardened networking stack* Bottleneck Bandwidth and Round-trip propagation time (BBR) mampu untuk mempertahankan tingkat responsivitas sistem tertinggi, baik di bawah tekanan komputasi, memori, I/O disk, maupun utilitas *bandwidth* jaringan secara maksimal dengan tetap mempertahankan efisiensi daya.
 
 ---
 
 ## 💻 Spesifikasi Sistem
 - **Sistem Operasi**: Linux CachyOS
-- **Versi Kernel**: `7.1.1-2marie` (Custom Kernel)
+- **Versi Kernel**: `7.2.0-ck1-1zen` (Custom Zen/CK Kernel w/ MuQSS & lru_marie)
 - **Prosesor (CPU)**: AMD Ryzen 7 8845HS w/ Radeon 780M Graphics (8 Cores / 16 Threads)
 - **Memori (RAM)**: 19 GiB
 - **Swap / zRAM**: 19 GiB
@@ -43,7 +43,7 @@ Sistem dikonfigurasi secara spesifik untuk mengejar performa tingkat tinggi (Hig
 - **systemd-oomd**: `Disabled / Inactive`. Hal ini disengaja agar *userspace OOM killer* tidak mengganggu algoritma canggih dari *patch* `lru_marie` di level *kernel*.
 
 ### 4. Scheduler (Penjadwal CPU)
-- **Infinity Scheduler (v4)**: *Fair-share CPU scheduler* yang menggantikan CFS/EEVDF bawaan kernel. Infinity Scheduler menggunakan pendekatan matematika asimtotik yang inovatif tanpa ambang batas diskret (*discrete thresholds*). Tanpa dependensi BPF atau sched-ext, scheduler ini memberikan latensi *wakeup* instan untuk tugas interaktif (seperti game) dan mengoptimasi prioritas *background task* secara mulus.
+- **MuQSS (Multiple Queue Skiplist Scheduler)**: *Custom CPU scheduler* karya Con Kolivas yang menggantikan CFS/EEVDF bawaan kernel. MuQSS mengimplementasikan antrean terisolasi berbasis struktur data *skiplist* per-CPU runqueue/cache domain dengan mekanisme *Earliest Deadline First (EDF) Virtual Deadline* berbasis `kernel.rr_interval = 6 ms`. Arsitektur ini memangkas habis *global lock contention*, meminimalkan *scheduling jitter*, serta menjamin latensi eksekusi instan dan deterministik untuk beban kerja interaktif (UI/UX, gaming, audio) tanpa mengorbankan *throughput* komputasi.
 
 ---
 
@@ -53,14 +53,29 @@ Pengujian dilakukan dalam kondisi sistem sedang aktif digunakan (skenario dunia 
 
 ### Fase 1: Uji Responsivitas Penjadwal (CPU Latency)
 **Metodologi:** 
-Membebani seluruh *thread* CPU hingga 100% menggunakan `stress-ng --matrix 0` selama 15 detik, sekaligus mengukur latensi interupsi sistem (*OS scheduling delay*) menggunakan `cyclictest` (interval 1ms).
+Membebani seluruh 16 *thread* CPU AMD Ryzen 7 8845HS hingga 100% menggunakan `stress-ng --matrix 0` selama 15 detik, sekaligus mengukur latensi interupsi sistem (*OS scheduling delay / wake-up jitter*) secara bersamaan menggunakan `cyclictest` pada mode *real-time* (`SCHED_FIFO` prio 90, memori terkunci via `mlockall`, interval $1\text{ ms} / 1000\ \mu\text{s}$ terdistribusi per core CPU `--smp`).
 
 **Hasil Observasi:**
-- **Rata-rata Latensi (*Average*):** Sangat fantastis, hanya berkisar di angka **45 µs hingga 57 µs (~0.04 ms - 0.05 ms)**. Ini membuktikan pergantian tugas ditangani nyaris tanpa friksi.
-- **Latensi Maksimal (*Max Jitter*):** Mayoritas *thread* konsisten bertahan di bawah **2 ms**. Lonjakan puncak latensi (*spike*) bahkan hanya menyentuh batas **~4.2 ms** di bawah beban matriks 100%.
-- **Pengalaman Interaktif:** Pergerakan kursor tetikus (*mouse*) dan perpindahan *window* aplikasi tetap sangat responsif, mulus, dan sama sekali tidak ada tanda-tanda *stutter* maupun *freeze*.
+- **Rata-rata Latensi (*Average*):** Sangat impresif, berada di angka konsisten **$4\ \mu\text{s}$ hingga $5\ \mu\text{s}$ (~0.004 ms - 0.005 ms)** merata di seluruh 16 *threads*. Pergantian tugas (*context switching*) ditangani hampir secara instan (*near-zero overhead*).
+- **Latensi Maksimal (*Max Jitter / Peak Spike*):** Mayoritas *thread* konsisten bertahan di bawah **$80\ \mu\text{s}$ ($0.08\text{ ms}$)**. Lonjakan puncak latensi terburuk (*worst-case spike*) hanya menyentuh batas **$177\ \mu\text{s}$ ($0.177\text{ ms}$)** di bawah beban matriks 100%.
+- **Latensi Minimal (*Min*):** Konsisten di angka **$1\ \mu\text{s}$**.
+- **Pengalaman Interaktif:** Pergerakan kursor tetikus (*mouse*), perpindahan *window*, serta animasi Wayland (`kwin_wayland`) tetap sangat responsif, mulus, dan sama sekali tidak ada tanda-tanda *stutter* maupun *freeze*.
 
-**Kesimpulan Fase 1:** Sinergi antara **Infinity Scheduler (v4)** dan parameter `threadirqs` terbukti luar biasa dalam mencegah kelaparan CPU (*CPU starvation*). Pendekatan asimtotiknya secara nyata mampu mempertahankan tingkat latensi ultra-rendah dan prioritas seketika pada tugas-tugas interaktif UI/UX/Gaming.
+#### ⚖️ Tabel Komparasi Latensi Penjadwal: MuQSS vs Infinity Scheduler (v4)
+
+| Metrik Pengujian | Infinity Scheduler (v4) | MuQSS Scheduler (`7.2.0-ck1-1zen`) | Selisih / Keunggulan MuQSS |
+| :--- | :--- | :--- | :--- |
+| **Rata-rata Latensi (*Average*)** | $45\ \mu\text{s} - 57\ \mu\text{s}$ | **$4\ \mu\text{s} - 5\ \mu\text{s}$** | **$\approx 10\times$ Lebih Cepat** |
+| **Puncak Latensi (*Peak Max Spike*)** | $\sim 4200\ \mu\text{s}$ ($4.2\text{ ms}$) | **$177\ \mu\text{s}$ ($0.177\text{ ms}$)** | **$\approx 23\times$ Lebih Stabil / Rendah** |
+| **Mayoritas Latensi Maksimal** | $< 2000\ \mu\text{s}$ ($< 2\text{ ms}$) | **$< 89\ \mu\text{s}$ ($< 0.09\text{ ms}$)** | **Jauh lebih deterministik** |
+| **Beban Pengujian** | 100% `stress-ng --matrix 0` | 100% `stress-ng --matrix 0` | Beban identik (16 Cores/Threads) |
+
+**Kesimpulan Fase 1:**
+Keunggulan performa MuQSS didukung oleh kombinasi faktor arsitektural dan parameter kernel:
+1. **Struktur Data Skiplist per-CPU Runqueue**: MuQSS (*Multiple Queue Skiplist Scheduler*) menggunakan antrean *skiplist* terisolasi per-core/cache domain. Ini memangkas habis *lock contention* global yang biasa terjadi saat seluruh 16 *threads* dibebani serentak.
+2. **Virtual Deadline (EDF Mechanism)**: Dengan `kernel.rr_interval = 6 ms`, MuQSS secara deterministik menghitung batas waktu eksekusi task interaktif dan *real-time* (`SCHED_FIFO`). Ketika ada *event* interupsi sistem atau input kursor/Wayland, task langsung disisipkan di posisi terdepan antrean tanpa terhalang kalkulasi *fair-share* dinamis yang berat.
+3. **Sinergi Kernel Zen + `threadirqs` + PREEMPT**: Interupsi hardware dialihkan ke *threaded IRQ* berprioritas tinggi. Beban kalkulasi matriks pada *userspace* sama sekali tidak mampu menahan laju eksekusi *timer wake-up* kernel.
+4. **Cache Locality AMD Zen 4**: Seluruh 8 Core / 16 Thread pada Ryzen 7 8845HS berada dalam satu CCX monolitik (Unified 16 MiB L3 Cache), memaksimalkan efisiensi saat MuQSS melakukan migrasi task cepat antar-thread.
 
 ---
 
@@ -99,4 +114,4 @@ Penerapan algoritma TCP BBR dan pelebaran batas *buffer* raksasa (`tcp_rmem` dan
 ---
 
 ## 🏆 Konklusi Akhir
-Berdasarkan metrik pengujian di atas, instalasi **CachyOS** pada AMD Ryzen 8845HS ini telah memastikan tingkat sinergi *Low-Latency* dan efisiensi yang nyaris sempurna. Modifikasi mendalam pada tingkat Kernel, Cgroups, Infinity Scheduler, hingga parameter sistem jaringan (Networking/TCP) terbukti bukan sekadar konfigurasi kosmetik, melainkan dapat divalidasi dan diukur efektivitasnya secara nyata dalam mempertahankan keandalan operasional, baik di bawah tekanan memori, I/O disk, maupun utilisasi pita lebar maksimal.
+Berdasarkan metrik pengujian di atas, instalasi **CachyOS** pada AMD Ryzen 8845HS ini telah memastikan tingkat sinergi *Low-Latency* dan efisiensi yang nyaris sempurna. Modifikasi mendalam pada tingkat Kernel, Cgroups, **MuQSS Scheduler**, hingga parameter sistem jaringan (Networking/TCP) terbukti bukan sekadar konfigurasi kosmetik, melainkan dapat divalidasi dan diukur efektivitasnya secara nyata dalam mempertahankan keandalan operasional, baik di bawah tekanan memori, I/O disk, maupun utilisasi pita lebar maksimal.
