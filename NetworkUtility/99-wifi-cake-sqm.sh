@@ -42,10 +42,6 @@ case "$ACTION" in
                 tc qdisc replace dev "$IFACE" root cake bandwidth 6mbit diffserv3 ack-filter overhead 44 mpu 64
                 logger -t "cake-sqm" "Applied CAKE profile for SSID '$SSID': Up 6Mbit (Down target 10Mbit)"
                 ;;
-            *"Team SO-FF PAMASUKA"*)
-                tc qdisc replace dev "$IFACE" root cake bandwidth 450mbit diffserv3 ack-filter overhead 44 mpu 64
-                logger -t "cake-sqm" "Applied CAKE profile for SSID '$SSID': Up 450Mbit (Down target 300Mbit)"
-                ;;
             *)
                 tc qdisc del dev "$IFACE" root 2>/dev/null; tc qdisc add dev "$IFACE" root cake diffserv3 ack-filter
                 logger -t "cake-sqm" "Applied CAKE unlimited profile for SSID '$SSID'"
