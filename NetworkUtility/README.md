@@ -18,10 +18,12 @@ NetworkManager dispatcher script (`/etc/NetworkManager/dispatcher.d/01-dhcp-defa
 #### 🚨 Masalah yang Diatasi:
 1. **RFC 3442 Classless Static Route Bug**: Server DHCP korporat (misal kantor Telkom) sering kali mengirimkan rute statis spesifik via Option 121 tanpa menyertakan rute default (`0.0.0.0/0`). Berdasarkan standar RFC 3442, NetworkManager secara otomatis mengabaikan Option 3 (Router/Gateway), mengakibatkan antarmuka LAN/Wi-Fi tidak memiliki default route sehingga koneksi internet publik mati total.
 2. **DNS Choke / Latensi Lambat di Jaringan Kantor**: DHCP kantor sering kali menyuntikkan DNS resolver lokal (`10.x.x.x`) yang membatasi kecepatan atau memblokir akses ke layanan pengembangan publik.
+3. **Roaming Stale Sockets & Blackhole Hang**: Saat berpindah jaringan (misal dari tethering/Wi-Fi rumah ke Wi-Fi kantor), koneksi TCP `language_server` (Antigravity IDE) masih menggantung pada IP lama atau mencoba menghubungi rentang `172.217.0.0/16` yang di-blackhole oleh router korporat. Hal ini membuat aplikasi stuck berstatus "Working..." tanpa henti.
 
 #### ⚙️ Solusi & Cara Kerja:
 - **Auto-Restore Default Route**: Pada trigger `up`, `dhcp4-change`, atau `reapply`, skrip memeriksa apakah ada *default route* pada interface. Jika kosong, skrip mengekstrak IP router dari environment `DHCP4_ROUTERS` atau `nmcli` dan memasang rute default secara dinamis (`ip route replace default via $ROUTER dev $IFACE metric $METRIC`).
 - **DNS Sanitization**: Jika antarmuka mendeteksi subnet `10.x.x.x`, DNS pada antarmuka tersebut otomatis diarahkan ke Cloudflare (`1.1.1.1`) dan Quad9 (`9.9.9.9`) melalui `resolvectl dns`, sehingga internet umum (browsing, Antigravity, git, OneDrive) dapat menikmati kecepatan penuh gigabit LAN tanpa tercekik latensi. Domain intranet kantor tetap ditangani oleh antarmuka VPN `tun0`.
+- **Fast Reconnect & Blackhole Socket Reset**: Skrip memicu pembersihan paksa soket TCP lama yang tertahan ke pool Google APIs (`ss -K 'dst 172.217.0.0/16'` dan `ss -K 'dst 142.250.0.0/15'`) agar koneksi langsung terputus dan terbentuk ulang seketika menggunakan IP baru tanpa menunggu timeout TCP berdurasi puluhan detik.
 
 #### 🛠️ Instalasi:
 ```bash
@@ -31,7 +33,24 @@ sudo chmod +x /etc/NetworkManager/dispatcher.d/01-dhcp-default-route.sh
 
 ---
 
-### 2. `split-dns.sh`
+### 2. Google APIs Edge VIPs (`/etc/hosts`)
+
+#### 🚨 Masalah yang Diatasi:
+Router / firewall kantor pada jaringan `10.131.40.1` (`Team SO-FF PAMASUKA`) mengalami salah konfigurasi rute (*bogons/null-route*) yang memblokir/me-drop seluruh rentang alamat IP publik `172.217.0.0/16`. Secara default, DNS global mengarahkan endpoint Google APIs (`daily-cloudcode-pa.googleapis.com`, `generativelanguage.googleapis.com`, `play.googleapis.com`) ke pool Singapura `172.217.112.4` – `172.217.119.4`. Akibatnya, Antigravity AI IDE tidak dapat mengirimkan prompt atau menerima respons (hang total), sementara web browser biasa lancar karena mengakses domain Google via rentang `216.x.x.x` atau `74.x.x.x`.
+
+#### ⚙️ Solusi:
+Tambahkan pemetaan IP Anycast Google Frontend global (`142.250.4.106`) langsung pada `/etc/hosts` agar tidak lagi mengarah ke rentang `172.217.0.0/16`:
+```hosts
+# Google APIs Edge VIPs (Bypass corporate 172.217.x.x blackhole on Team SO-FF PAMASUKA)
+142.250.4.106 daily-cloudcode-pa.googleapis.com
+142.250.4.106 generativelanguage.googleapis.com
+142.250.4.106 play.googleapis.com
+```
+Alamat `142.250.4.106` terbukti lolos dari blokir router korporat, memiliki latensi rendah (~200 ms), dan menyajikan sertifikat SSL wildcard valid `*.googleapis.com`.
+
+---
+
+### 3. `split-dns.sh`
 VPNC post-connect hook script (`/etc/vpnc/post-connect.d/split-dns.sh`) untuk integrasi OpenConnect / GlobalProtect dengan `systemd-resolved`.
 
 #### 🚨 Masalah yang Diatasi:
@@ -53,7 +72,7 @@ sudo chmod +x /etc/vpnc/post-connect.d/split-dns.sh
 
 ---
 
-### 3. `dns.conf`
+### 4. `dns.conf`
 Drop-in configuration file untuk `systemd-resolved` (`/etc/systemd/resolved.conf.d/dns.conf`).
 
 #### ⚙️ Konfigurasi & Fitur:
@@ -72,7 +91,7 @@ sudo systemctl restart systemd-resolved
 
 ---
 
-### 4. `99-wifi-cake-sqm.sh`
+### 5. `99-wifi-cake-sqm.sh`
 NetworkManager dispatcher script (`/etc/NetworkManager/dispatcher.d/99-wifi-cake-sqm.sh`) untuk menerapkan antrean **CAKE SQM (Common Applications Kept Enhanced)** secara otomatis dan dinamis berdasarkan SSID Wi-Fi yang sedang terhubung.
 
 #### ⚙️ Profil & Fitur:
@@ -83,7 +102,7 @@ NetworkManager dispatcher script (`/etc/NetworkManager/dispatcher.d/99-wifi-cake
   - `Lokale Select Sudirman`: Up 40 Mbit (Down target 70 Mbit)
   - `ROCVI`: Up 25 Mbit (Down target 95 Mbit)
   - `@28FINEST`: Up 6 Mbit (Down target 10 Mbit)
-  - `Team SO-FF PAMASUKA`: Up 450 Mbit (Down target 300 Mbit)
+  - `Team SO-FF PAMASUKA`: Mode CAKE *unlimited* (adaptif)
   - `Default / SSID Lain`: Mode CAKE *unlimited* (tanpa pembatasan bandwidth)
 - **Anti-Bufferbloat**: Menggunakan algoritma `diffserv3` (prioritas 3-tingkat: bulk, best effort, voice/interactive) dan `ack-filter` untuk mengompresi ACK packet pada link asimetris, mencegah latensi melonjak saat upload penuh.
 - **Overhead Framing**: Menyesuaikan `overhead 44 mpu 64` untuk encapsulasi frame 802.11 Wi-Fi.
@@ -96,7 +115,7 @@ sudo chmod +x /etc/NetworkManager/dispatcher.d/99-wifi-cake-sqm.sh
 
 ---
 
-### 5. `bbr3_benchmark.fish`
+### 6. `bbr3_benchmark.fish`
 Skrip native Fish shell untuk menjalankan *single-stream* TCP download jarak jauh ke server benua Eropa (default: Hetzner Jerman) sekaligus mengambil sampling telemetri soket TCP kernel (`ss -tin`) secara real-time.
 
 #### 🚀 Cara Penggunaan:
@@ -119,7 +138,7 @@ fish NetworkUtility/bbr3_benchmark.fish "https://mirror.nl.leaseweb.net/speedtes
 
 ---
 
-### 6. `bbr3_inspect.py`
+### 7. `bbr3_inspect.py`
 Skrip Python untuk membaca struktur internal `tcp_bbr_info` langsung dari kernel Linux menggunakan socket option `TCP_CC_INFO` (`getsockopt`).
 
 #### 🚀 Cara Penggunaan:

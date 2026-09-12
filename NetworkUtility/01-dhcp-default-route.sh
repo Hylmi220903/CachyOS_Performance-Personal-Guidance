@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# Auto-restore default route (RFC 3442 fix) & Clean DNS for 10.x.x.x networks
+# Auto-restore default route (RFC 3442 fix), Clean DNS & Stale Socket Reset
 # ==============================================================================
 
 IFACE="$1"
@@ -51,6 +51,13 @@ case "$ACTION" in
                 logger -t "nm-dispatcher-dhcp" "Sanitized DNS for 10.x.x.x interface $IFACE (assigned 1.1.1.1/9.9.9.9)"
             fi
         fi
+
+        # 3. Roaming Fast Reconnect & Blackhole Socket Reset:
+        # Closes stale TCP sockets lingering on disconnected/dead IP ranges (e.g. 172.217.0.0/16)
+        # to ensure immediate reconnect for Antigravity & background services without 60s TCP timeouts.
+        ss -K 'dst 172.217.0.0/16' 2>/dev/null || true
+        ss -K 'dst 142.250.0.0/15' 2>/dev/null || true
+        logger -t "nm-dispatcher-dhcp" "Reset stale Google API sockets on network transition for $IFACE"
         ;;
 esac
 
