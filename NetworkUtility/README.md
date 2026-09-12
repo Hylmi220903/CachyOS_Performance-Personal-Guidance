@@ -5,7 +5,7 @@ Kumpulan utilitas, skrip otomasi dispatcher, hook VPN, dan konfigurasi jaringan 
 - Membaca telemetri *state machine* kernel Linux **TCP BBRv3**.
 - Otomasi **CAKE Smart Queue Management (SQM)** per SSID Wi-Fi untuk mengeliminasi *bufferbloat*.
 - Mengatasi problem rute bawaan DHCP korporat (**RFC 3442 Option 121**) agar koneksi LAN/Wi-Fi tidak kehilangan *default gateway*.
-- Drop-in konfigurasi **systemd-resolved** dengan **Cloudflare** (ultra-fast, bebas drop EDNS0) + **Quad9** (malware blocking) via UDP 53 stabil tanpa *timeout* firewall kantor.
+- Drop-in konfigurasi **systemd-resolved** dengan **Quad9** (malware blocking) + **Cloudflare** (ultra-fast fallback) via UDP 53 stabil tanpa *timeout* firewall kantor.
 - Automasi **Split-DNS Telkom** via VPNC post-connect hook untuk OpenConnect / GlobalProtect.
 
 ---
@@ -76,10 +76,10 @@ sudo chmod +x /etc/vpnc/post-connect.d/split-dns.sh
 Drop-in configuration file untuk `systemd-resolved` (`/etc/systemd/resolved.conf.d/dns.conf`).
 
 #### ⚙️ Konfigurasi & Fitur:
-- **Primary DNS**: **Cloudflare** (`1.1.1.1`, `2606:4700:4700::1111`) — Resolusi DNS global berkecepatan ultra-tinggi (19 ms), andal, dan terbukti tidak di-drop oleh inspeksi EDNS0 firewall korporat.
-- **Secondary DNS**: **Quad9** (`9.9.9.9`, `2620:fe::fe`) — Proteksi keamanan aktif terhadap malware, phishing, dan infrastruktur C2 berbahaya secara langsung di level DNS.
-- **Fallback DNS**: Cloudflare Secondary (`1.0.0.1`, `2606:4700:4700::1001`) & Quad9 Secondary (`149.112.112.112`, `2620:fe::9`).
-- **Global Routing Domain**: `Domains=~.` — Menjadikan Cloudflare/Quad9 sebagai *default routing target* untuk semua domain internet umum, mencegah kebocoran DNS saat split-tunneling VPN berjalan.
+- **Primary DNS**: **Quad9** (`9.9.9.9`, `2620:fe::fe`) — Proteksi keamanan aktif terhadap malware, phishing, dan infrastruktur C2 berbahaya secara langsung di level DNS.
+- **Secondary DNS**: **Cloudflare** (`1.1.1.1`, `2606:4700:4700::1111`) — Resolusi DNS global berkecepatan ultra-tinggi (19 ms), andal, dan terbukti tidak di-drop oleh inspeksi EDNS0 firewall korporat.
+- **Fallback DNS**: Quad9 Secondary (`149.112.112.112`, `2620:fe::9`) & Cloudflare Secondary (`1.0.0.1`, `2606:4700:4700::1001`).
+- **Global Routing Domain**: `Domains=~.` — Menjadikan Quad9/Cloudflare sebagai *default routing target* untuk semua domain internet umum, mencegah kebocoran DNS saat split-tunneling VPN berjalan.
 - **DNSOverTLS=no**: **Alasan Kritis** — Firewall korporat/kantor Telkom memblokir/me-drop traffic port 853 (DoT). Mengaktifkan DoT menyebabkan query DNS mengalami *TCP connection timeout* selama 10–12 detik per request sebelum fallback. Dengan UDP port 53 standar, latensi DNS instan (<5 ms lokal cache), dan keamanan tetap terjaga melalui filter malware Quad9.
 - **Optimasi Tambahan**: `LLMNR=no` (menghindari broadcast noise), `Cache=yes`, `StaleRetentionSec=3600` (melayani cache kedaluwarsa sementara saat koneksi jaringan transisi).
 
